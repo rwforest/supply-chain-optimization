@@ -9,6 +9,9 @@ served as an MCP tool from a Databricks App.
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 
 import pandas as pd
@@ -21,6 +24,21 @@ import dataset_io as dio
 
 CATALOG = os.getenv("SC_CATALOG", "supply_chain_stress_test")
 SCHEMA = os.getenv("SC_SCHEMA", "data")
+
+# Maximum number of changed variables to inline in the tool result. The delta
+# between the baseline and disrupted solves is what mitigation advice needs;
+# capping it keeps the payload bounded regardless of network size. Changes are
+# ranked by magnitude so the most significant reroutes always survive the cap.
+MAX_CHANGES = int(os.getenv("SC_MAX_CHANGES", "300"))
+
+# Values below this are treated as unchanged (decision vars are integer-domain,
+# so this only absorbs solver float noise).
+_EPS = 1e-6
+
+# Optional UC volume to persist the full optimized network to when the delta is
+# truncated (e.g. "/Volumes/supply_chain_stress_test/data/results"). Unset by
+# default so the base deployment needs no extra WRITE_VOLUME grant.
+RESULT_VOLUME = os.getenv("SC_RESULT_VOLUME")
 
 
 def _load_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -50,42 +68,119 @@ def load_dataset() -> dict:
     return dio.reconstruct_dataset_from_frames(nodes_df, edges_df, bom_df)
 
 
-def _var_records(model) -> list[dict]:
-    records = []
+def _var_values(model) -> dict[str, float]:
+    """Flatten a solved model's decision variables into a ``key -> value`` map.
+
+    Keys are stable strings like ``u[T2_4]`` or ``y[('T2_4', 'T1_1')]`` so two
+    solves can be diffed directly.
+    """
+    values: dict[str, float] = {}
     for v in model.component_data_objects(ctype=pyo.Var, active=True):
-        records.append(
-            {
-                "var_name": v.parent_component().name,
-                "index": v.index(),
-                "value": pyo.value(v),
-            }
-        )
-    return records
+        key = f"{v.parent_component().name}[{v.index()}]"
+        values[key] = pyo.value(v)
+    return values
+
+
+def _compute_delta(before: dict[str, float], after: dict[str, float]) -> list[dict]:
+    """Variables whose optimized value changed between the two solves.
+
+    Returned records are sorted by absolute change (largest first) so callers
+    that truncate keep the most significant reroutes.
+    """
+    changes = []
+    for key in before.keys() | after.keys():
+        b = before.get(key, 0.0)
+        a = after.get(key, 0.0)
+        if abs(a - b) > _EPS:
+            changes.append({"var": key, "baseline": b, "disrupted": a, "change": a - b})
+    changes.sort(key=lambda c: abs(c["change"]), reverse=True)
+    return changes
+
+
+def _persist_full_network(before: dict, after: dict, disrupted: list[str], ttr: float) -> str | None:
+    """Write the complete optimized network to a UC volume as CSV; return path.
+
+    Returns ``None`` (never raises) if no volume is configured or the write
+    fails, so a persistence problem can't take down the tool call.
+    """
+    if not RESULT_VOLUME:
+        return None
+    try:
+        rows = []
+        for key in before.keys() | after.keys():
+            rows.append({
+                "var": key,
+                "baseline": before.get(key, 0.0),
+                "disrupted": after.get(key, 0.0),
+            })
+        df = pd.DataFrame(rows).sort_values("var")
+        tag = hashlib.sha1(
+            f"{sorted(disrupted)}|{ttr}".encode()
+        ).hexdigest()[:12]
+        path = f"{RESULT_VOLUME.rstrip('/')}/stress_test_{tag}.csv"
+
+        from databricks.sdk import WorkspaceClient
+
+        buf = io.BytesIO(df.to_csv(index=False).encode())
+        WorkspaceClient().files.upload(path, buf, overwrite=True)
+        return path
+    except Exception:
+        return None
 
 
 def run_stress_test(disrupted: list[str], ttr: float) -> str:
     """Run the TTR (with/without disruption) and TTS optimization.
 
-    Mirrors ``optimization_tool`` in ``agent/supply_chain_agent.py``: solves the
-    TTR model without disruption, then with the disruption, then the TTS model,
-    and returns a single comma-joined ``key=value`` string.
+    Returns a compact ``key=value`` string with the scenario summary plus only
+    the variables whose optimized value *changed* between the baseline and the
+    disrupted solve. The delta is what mitigation advice needs, and it stays
+    small even on large networks (the full assignment scales with nodes+edges).
+    The change list is capped at ``MAX_CHANGES`` and, when a result volume is
+    configured, the complete network is persisted and its path returned.
     """
     dataset = load_dataset()
 
     # TTR without disruption (baseline)
     df_without = utils.build_and_solve_ttr(dataset, [], ttr, True)
-    records_without = _var_records(df_without["model"].values[0])
+    values_without = _var_values(df_without["model"].values[0])
 
     # TTR with disruption
     df_with = utils.build_and_solve_ttr(dataset, disrupted, ttr, True)
-    records_with = _var_records(df_with["model"].values[0])
-
-    df = df_with.drop(["model"], axis=1)
-    df["optimized_network_without_disruption"] = str(records_without)
-    df["optimized_network_with_disruption"] = str(records_with)
+    values_with = _var_values(df_with["model"].values[0])
 
     # TTS with disruption
     df_tts = utils.build_and_solve_tts(dataset, disrupted, False)
-    df["tts"] = df_tts["tts"].values[0]
 
-    return ",".join(f"{k}={v}" for k, v in df.iloc[0].astype(str).items())
+    changes = _compute_delta(values_without, values_with)
+    total_changes = len(changes)
+    truncated = total_changes > MAX_CHANGES
+    shown = changes[:MAX_CHANGES]
+
+    full_network_path = None
+    if truncated:
+        full_network_path = _persist_full_network(
+            values_without, values_with, disrupted, ttr
+        )
+
+    num_nodes = len(dataset["tier1"]) + len(dataset["tier2"]) + len(dataset["tier3"])
+    summary = {
+        "disrupted": disrupted,
+        "ttr": ttr,
+        "termination_condition": str(df_with["termination_condition"].values[0]),
+        "lost_profit": float(df_with["lost_profit"].values[0]),
+        "tts": float(df_tts["tts"].values[0]),
+        "network_size": {"nodes": num_nodes, "edges": len(dataset["edges"])},
+        "num_changed_variables": total_changes,
+        "changes_truncated": truncated,
+    }
+    if full_network_path:
+        summary["full_network_path"] = full_network_path
+
+    # Compact, readable change list: "u[T2_4]: 1323.0 -> 0.0"
+    changes_str = "; ".join(
+        f"{c['var']}: {c['baseline']:g} -> {c['disrupted']:g}" for c in shown
+    )
+
+    parts = [f"{k}={v}" for k, v in summary.items()]
+    parts.append(f"network_changes_vs_baseline=[{changes_str}]")
+    return ",".join(parts)
