@@ -35,6 +35,20 @@
       "id": "supply-chain-mcp",
       "created_at": "2026-07-02T04:03:46.281529+00:00",
       "updated_at": "2026-07-02T04:03:46.281529+00:00"
+    },
+    {
+      "type": "multi_agent_supervisor",
+      "name": "Supply_Chain_Supervisor",
+      "id": "3dd7e8a7-1b6f-45a9-945c-64480e0825c8",
+      "created_at": "2026-07-02T06:29:51.186218+00:00",
+      "updated_at": "2026-07-02T06:29:51.186218+00:00"
+    },
+    {
+      "type": "job",
+      "name": "supply-chain-supervisor-eval",
+      "id": "65793391499697",
+      "created_at": "2026-07-02T06:53:38.363365+00:00",
+      "updated_at": "2026-07-02T06:53:38.363365+00:00"
     }
   ]
 }
