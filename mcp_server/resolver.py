@@ -10,9 +10,8 @@ served as an MCP tool from a Databricks App.
 from __future__ import annotations
 
 import hashlib
-import io
-import json
 import os
+import uuid
 
 import pandas as pd
 import pyomo.environ as pyo
@@ -35,10 +34,14 @@ MAX_CHANGES = int(os.getenv("SC_MAX_CHANGES", "300"))
 # so this only absorbs solver float noise).
 _EPS = 1e-6
 
-# Optional UC volume to persist the full optimized network to when the delta is
-# truncated (e.g. "/Volumes/supply_chain_stress_test/data/results"). Unset by
-# default so the base deployment needs no extra WRITE_VOLUME grant.
-RESULT_VOLUME = os.getenv("SC_RESULT_VOLUME")
+# Lakebase (Postgres) sink for the full optimized network. The complete
+# assignment scales with nodes+edges, so it is persisted here every run and the
+# tool result carries only a scenario_id pointer plus the delta. When the app
+# has a Lakebase resource attached, PGHOST/PGDATABASE/PGUSER are injected and
+# PGPASSWORD is minted per-call via an OAuth token (1h TTL). SC_LAKEBASE_INSTANCE
+# names the instance for token generation.
+LAKEBASE_INSTANCE = os.getenv("SC_LAKEBASE_INSTANCE", "supply-chain-lakebase")
+LAKEBASE_SCHEMA = os.getenv("SC_LAKEBASE_SCHEMA", "supply_chain")
 
 
 def _load_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -97,35 +100,99 @@ def _compute_delta(before: dict[str, float], after: dict[str, float]) -> list[di
     return changes
 
 
-def _persist_full_network(before: dict, after: dict, disrupted: list[str], ttr: float) -> str | None:
-    """Write the complete optimized network to a UC volume as CSV; return path.
+def _scenario_id(disrupted: list[str], ttr: float) -> str:
+    """Stable id for a scenario so re-running upserts rather than duplicates."""
+    return hashlib.sha1(f"{sorted(disrupted)}|{ttr}".encode()).hexdigest()[:16]
 
-    Returns ``None`` (never raises) if no volume is configured or the write
-    fails, so a persistence problem can't take down the tool call.
+
+def _lakebase_conn():
+    """Open a psycopg connection to Lakebase.
+
+    Uses the app-injected PG* env vars for host/db/user and mints a fresh OAuth
+    token as the password. Returns ``None`` if Lakebase is not configured.
     """
-    if not RESULT_VOLUME:
+    host = os.getenv("PGHOST")
+    if not host:
         return None
+
+    import psycopg
+    from databricks.sdk import WorkspaceClient
+
+    user = os.getenv("PGUSER") or Config().client_id
+    dbname = os.getenv("PGDATABASE", "databricks_postgres")
+    port = os.getenv("PGPORT", "5432")
+
+    token = os.getenv("PGPASSWORD")
+    if not token:
+        cred = WorkspaceClient().database.generate_database_credential(
+            request_id=str(uuid.uuid4()), instance_names=[LAKEBASE_INSTANCE]
+        )
+        token = cred.token
+
+    return psycopg.connect(
+        host=host, dbname=dbname, user=user, password=token,
+        port=port, sslmode="require",
+    )
+
+
+def _persist_full_network(
+    scenario_id: str,
+    summary: dict,
+    before: dict,
+    after: dict,
+) -> bool:
+    """Upsert the scenario summary + full optimized network into Lakebase.
+
+    Returns True on success, False (never raises) if Lakebase is unconfigured or
+    the write fails, so a persistence problem can't take down the tool call.
+    """
     try:
-        rows = []
-        for key in before.keys() | after.keys():
-            rows.append({
-                "var": key,
-                "baseline": before.get(key, 0.0),
-                "disrupted": after.get(key, 0.0),
-            })
-        df = pd.DataFrame(rows).sort_values("var")
-        tag = hashlib.sha1(
-            f"{sorted(disrupted)}|{ttr}".encode()
-        ).hexdigest()[:12]
-        path = f"{RESULT_VOLUME.rstrip('/')}/stress_test_{tag}.csv"
-
-        from databricks.sdk import WorkspaceClient
-
-        buf = io.BytesIO(df.to_csv(index=False).encode())
-        WorkspaceClient().files.upload(path, buf, overwrite=True)
-        return path
+        conn = _lakebase_conn()
+        if conn is None:
+            return False
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {LAKEBASE_SCHEMA}.stress_test_runs
+                    (scenario_id, disrupted, ttr, termination_condition,
+                     lost_profit, tts, num_nodes, num_edges, num_changed_variables)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (scenario_id) DO UPDATE SET
+                    disrupted = EXCLUDED.disrupted,
+                    ttr = EXCLUDED.ttr,
+                    termination_condition = EXCLUDED.termination_condition,
+                    lost_profit = EXCLUDED.lost_profit,
+                    tts = EXCLUDED.tts,
+                    num_nodes = EXCLUDED.num_nodes,
+                    num_edges = EXCLUDED.num_edges,
+                    num_changed_variables = EXCLUDED.num_changed_variables,
+                    created_at = now()
+                """,
+                (
+                    scenario_id, summary["disrupted"], summary["ttr"],
+                    summary["termination_condition"], summary["lost_profit"],
+                    summary["tts"], summary["network_size"]["nodes"],
+                    summary["network_size"]["edges"], summary["num_changed_variables"],
+                ),
+            )
+            # Replace the detail rows for this scenario, then bulk insert.
+            cur.execute(
+                f"DELETE FROM {LAKEBASE_SCHEMA}.stress_test_network WHERE scenario_id = %s",
+                (scenario_id,),
+            )
+            rows = [
+                (scenario_id, key, before.get(key, 0.0), after.get(key, 0.0))
+                for key in before.keys() | after.keys()
+            ]
+            cur.executemany(
+                f"INSERT INTO {LAKEBASE_SCHEMA}.stress_test_network "
+                f"(scenario_id, var, baseline, disrupted_v) VALUES (%s, %s, %s, %s)",
+                rows,
+            )
+        conn.close()
+        return True
     except Exception:
-        return None
+        return False
 
 
 def run_stress_test(disrupted: list[str], ttr: float) -> str:
@@ -135,8 +202,9 @@ def run_stress_test(disrupted: list[str], ttr: float) -> str:
     the variables whose optimized value *changed* between the baseline and the
     disrupted solve. The delta is what mitigation advice needs, and it stays
     small even on large networks (the full assignment scales with nodes+edges).
-    The change list is capped at ``MAX_CHANGES`` and, when a result volume is
-    configured, the complete network is persisted and its path returned.
+    The change list is capped at ``MAX_CHANGES``; the complete optimized network
+    is always persisted to Lakebase under ``scenario_id`` (queryable in the
+    ``stress_test_runs`` / ``stress_test_network`` tables).
     """
     dataset = load_dataset()
 
@@ -156,14 +224,10 @@ def run_stress_test(disrupted: list[str], ttr: float) -> str:
     truncated = total_changes > MAX_CHANGES
     shown = changes[:MAX_CHANGES]
 
-    full_network_path = None
-    if truncated:
-        full_network_path = _persist_full_network(
-            values_without, values_with, disrupted, ttr
-        )
-
     num_nodes = len(dataset["tier1"]) + len(dataset["tier2"]) + len(dataset["tier3"])
+    scenario_id = _scenario_id(disrupted, ttr)
     summary = {
+        "scenario_id": scenario_id,
         "disrupted": disrupted,
         "ttr": ttr,
         "termination_condition": str(df_with["termination_condition"].values[0]),
@@ -173,8 +237,12 @@ def run_stress_test(disrupted: list[str], ttr: float) -> str:
         "num_changed_variables": total_changes,
         "changes_truncated": truncated,
     }
-    if full_network_path:
-        summary["full_network_path"] = full_network_path
+
+    # Always persist the full network to Lakebase; report whether it landed so
+    # the agent knows if the scenario_id is queryable.
+    summary["full_network_persisted"] = _persist_full_network(
+        scenario_id, summary, values_without, values_with
+    )
 
     # Compact, readable change list: "u[T2_4]: 1323.0 -> 0.0"
     changes_str = "; ".join(

@@ -4,4 +4,5 @@ pandas
 pyomo
 highspy
 databricks-sql-connector
-databricks-sdk
+databricks-sdk>=0.81.0
+psycopg[binary]

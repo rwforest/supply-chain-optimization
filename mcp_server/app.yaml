@@ -12,3 +12,5 @@ env:
     value: supply_chain_stress_test
   - name: SC_SCHEMA
     value: data
+  - name: SC_LAKEBASE_INSTANCE
+    value: supply-chain-lakebase
