@@ -41,10 +41,15 @@ User → Supervisor Agent (Agent Bricks MAS)
         ├── genie_data_agent   → Genie space → UC tables (nodes / edges / bom)
         └── optimization_agent → UC HTTP (MCP) connection → Databricks App
                                                              (FastAPI /api/mcp, pyomo TTR/TTS)
+                                                                  │
+                                                                  └── Lakebase (Postgres):
+                                                                      full optimized network
+                                                                      per scenario_id
 ```
 
 - **Data → Genie space.** `agent/00_setup_genie_data.ipynb` decomposes the nested dataset into three normalized Unity Catalog tables — `nodes`, `edges`, `bom` — using `scripts/dataset_io.py`. A Genie space over these tables answers natural-language data-lookup questions, replacing `data_analysis_tool`. The tables are the single source of truth.
 - **Resolver → MCP server.** `mcp_server/` is a FastAPI app hosted on Databricks Apps that exposes the pyomo optimizer as an MCP tool (`run_supply_chain_stress_test`) over JSON-RPC 2.0 at `POST /api/mcp`. On each call it reads the same UC tables, rebuilds the dataset via `dataset_io.reconstruct_dataset_from_frames`, and runs the identical TTR/TTS computation from `scripts/utils.py`, replacing `optimization_tool`.
+- **Bounded tool result + Lakebase persistence.** The full decision-variable assignment scales with nodes+edges, so returning it inline blows out the supervisor's LLM context and hits the Databricks App ~1MB response cap. Instead the tool returns a compact summary (`scenario_id`, `lost_profit`, `tts`, `termination_condition`, `network_size`) plus **only the variables whose optimized value changed** between the baseline and disrupted solves — ranked by magnitude and capped at `SC_MAX_CHANGES` (default 300) so the payload stays bounded on any network size. The complete optimized network for both solves is persisted on every run to **Lakebase** (managed Postgres) under a stable `scenario_id`: a summary row in `supply_chain.stress_test_runs` and the full assignment in `supply_chain.stress_test_network`, queryable after the fact. Persistence is best-effort — a Lakebase outage degrades to summary+delta rather than failing the tool call, and `full_network_persisted` in the result reports whether the `scenario_id` is queryable. The instance is attached to the app as a database resource (`SC_LAKEBASE_INSTANCE`); the app service principal mints a 1h OAuth token per connection.
 - **Supervisor.** A Databricks Multi-Agent Supervisor (Agent Bricks) routes data questions to the Genie agent and disruption/recovery questions to the optimization MCP agent.
 - **Evaluation.** `agent/02b_evaluate_supervisor.ipynb` mirrors `02_evaluate_agent.ipynb`, replacing the tool-usage scorer with a **routing** scorer (`expected_agent`: `genie_data_agent` vs `optimization_agent`) and keeping the response-quality scorers.
 
