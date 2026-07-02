@@ -19,6 +19,39 @@ The solution accelerator demonstrates how to build, evaluate and deploy such an 
 
 <img src='../images/agent-architecture.png' width=650>
 
+## Two agent architectures in this repo
+
+This repo contains two interchangeable ways to run the supply chain assistant.
+
+### 1. Single LangGraph agent (original)
+
+`supply_chain_agent.py` is one LangGraph agent with two hardcoded tools:
+
+- `data_analysis_tool` — reads `dataset_small.json` from a Unity Catalog Volume and returns the whole dataset.
+- `optimization_tool` — reloads that JSON and runs the pyomo TTR/TTS optimization from `scripts/utils.py`.
+
+Notebooks: `01_build_agent` → `02_evaluate_agent` → `03_deploy_agent`.
+
+### 2. Genie + MCP + Multi-Agent Supervisor (decomposed)
+
+The same capabilities, decomposed into Databricks-native, independently-governed building blocks:
+
+```
+User → Supervisor Agent (Agent Bricks MAS)
+        ├── genie_data_agent   → Genie space → UC tables (nodes / edges / bom)
+        └── optimization_agent → UC HTTP (MCP) connection → Databricks App
+                                                             (FastAPI /api/mcp, pyomo TTR/TTS)
+```
+
+- **Data → Genie space.** `agent/00_setup_genie_data.ipynb` decomposes the nested dataset into three normalized Unity Catalog tables — `nodes`, `edges`, `bom` — using `scripts/dataset_io.py`. A Genie space over these tables answers natural-language data-lookup questions, replacing `data_analysis_tool`. The tables are the single source of truth.
+- **Resolver → MCP server.** `mcp_server/` is a FastAPI app hosted on Databricks Apps that exposes the pyomo optimizer as an MCP tool (`run_supply_chain_stress_test`) over JSON-RPC 2.0 at `POST /api/mcp`. On each call it reads the same UC tables, rebuilds the dataset via `dataset_io.reconstruct_dataset_from_frames`, and runs the identical TTR/TTS computation from `scripts/utils.py`, replacing `optimization_tool`.
+- **Supervisor.** A Databricks Multi-Agent Supervisor (Agent Bricks) routes data questions to the Genie agent and disruption/recovery questions to the optimization MCP agent.
+- **Evaluation.** `agent/02b_evaluate_supervisor.ipynb` mirrors `02_evaluate_agent.ipynb`, replacing the tool-usage scorer with a **routing** scorer (`expected_agent`: `genie_data_agent` vs `optimization_agent`) and keeping the response-quality scorers.
+
+The `mcp_server/` bundles copies of `scripts/utils.py` and `scripts/dataset_io.py` so the app is self-contained.
+
+**Wiring the MCP server to the Supervisor** requires a Unity Catalog HTTP connection with `is_mcp_connection='true'` pointing at the app's `/api/mcp` endpoint, authenticated with a service-principal OAuth (M2M) secret that has `CAN USE` on the app. Grant `USE CONNECTION` on that connection to the supervisor's service principal, then reference it via `connection_name` in `manage_mas`.
+
 ## Authors
 
 <ryuta.yoshimatsu@databricks.com>, <puneet.jain@databricks.com>

@@ -1,0 +1,14 @@
+command:
+  - uvicorn
+  - app:app
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8000"
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: SC_CATALOG
+    value: supply_chain_stress_test
+  - name: SC_SCHEMA
+    value: data
