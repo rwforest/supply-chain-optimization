@@ -66,9 +66,46 @@ A handful of the regional/material scenarios are inspired by real historical eve
 
 The flow-balance constraint in the (unmodified) LP lets a disrupted node keep shipping from its pre-existing on-hand inventory even though its own production is halted — and that inventory is a *fixed* quantity, not scaled by how long the disruption lasts. A short disruption at a well-stocked node can show zero measurable impact while a longer one at the same node shows real impact; this is expected behavior of the underlying model, not a bug. Separately, `run_scenario_tts` normalizes an "unbounded" TTS solver result (the network has enough redundancy/headroom to absorb the disruption indefinitely) to `tts = inf`, since the solver's raw objective value in that case is a meaningless artifact of wherever the simplex method stopped, not a real bound.
 
+### Time-Phased Multi-Period Planning & Network Decomposition
+
+`build_and_solve_ttr`/`build_and_solve_tts` (and the 8 objective variants alongside them) are all **single-snapshot** LPs: one scalar horizon `t`, a disruption that's either on or off for the whole horizon, and no notion of a shipment departing now and arriving later. `scripts/multi_period_planning.py` and `scripts/network_aggregation.py` add two **new, additive** capabilities modeled after Adexa's two biggest structural advantages over that kind of model — neither module modifies `scripts/utils.py`, `scripts/disruption_scenarios.py`, `scripts/realistic_topologies.py`, `scripts/dataset_io.py`, or `scripts/company_profiles.py`; both reuse them read-only (`_prep_lp_data`, `derive_indexes`). See `08_multi_period_planning.ipynb` for a runnable walkthrough of everything below.
+
+**Schema additions** (all optional — omitting them keeps every existing notebook/test unaffected):
+
+| Field | Shape | Used by |
+|---|---|---|
+| `production_delay` | `{node: lead_time_days}` | Lead-time offset (`offset[i] = ceil(production_delay[i] / period_length_days)`) |
+| `unit_cost`, `holding_cost`, `emissions_factor` | `{node: value}` | Not consumed by the time-phased TTR objective itself; calibrated by `scenario_calibration.calibrate_cost_fields` for parity with the other LP objectives |
+| `transport_emissions` | `{(src, tgt): value}` | Same as above |
+
+`TimePhasedDisruption` replaces a scalar `ttr` with a `period_start`/`duration_periods` window on a discrete period axis — `from_legacy_scenario` converts an existing `DisruptionScenario` (`duration_periods = ceil(ttr / period_length_days)`, never rounded down).
+
+**Lead-time-offset worked example:** a supplier with `production_delay = 14` days at `period_length_days = 7` has `offset = 2` — a shipment departing that supplier in period `t` can only satisfy downstream demand starting period `t + 2`. With zero pre-horizon in-transit inventory (the default — see limitations below), the first 2 periods of a cold-started network show full lost demand for anything sourced exclusively from that supplier, then recovery once the first shipment arrives.
+
+**Aggregate/disaggregate decomposition** (`scripts/network_aggregation.py`, modeled after Adexa's Strategic Network Optimizer): `build_aggregate_dataset` pools tier-3 nodes sharing the same `(supplier_material_type, criticality)` into one synthetic group node (`c_agg = Σc_i`, `s_agg = Σs_i`, edges = union of members'). `monopoly_bottleneck` nodes are never pooled — an aggregate node can't be "35% disrupted," and pooling away the network's actual single points of failure would defeat the point of this whole accelerator. `disaggregation_scope` determines which real nodes must be restored to full fidelity for a given disruption: (1) the disrupted node's entire group, always; (2) its downstream consumer cone, `expansion_hops` deep (default 1); (3) its upstream alternate suppliers (the other members of every `P[j][k]` the disrupted node belongs to as a supplier). `run_aggregate_then_disaggregate` orchestrates solve-aggregate → compute scope → rebuild mixed-fidelity dataset → re-solve.
+
+Benchmark (medium dataset, ~700 nodes, a 4-period disruption at its longest-lead-time node, `n_periods=10`):
+
+| Network variant | Tier-3 nodes | Solve time | `lost_profit` |
+|---|---|---|---|
+| Full | 480 | ~0.94s (direct) | 16778.56 |
+| Aggregate only | 160 | ~0.94s | 16778.56 (matched full in this instance — not guaranteed) |
+| Partial (disaggregated) | 160 | ~0.92s | 16778.56 (matches full exactly) |
+
+The partial solve reproduces the full network's result exactly while operating on a structurally smaller model — but at this particular ~700-node scale, combined aggregate+partial wall-clock (~1.9s) was actually *slower* than one direct full-network solve (~1.4s); HiGHS solve time didn't scale down proportionally with the node-count reduction here. The benefit is expected to grow with network size, not to be a universal speedup at every scale — report timings honestly rather than assuming decomposition always wins.
+
+**Limitations**, in addition to the ones already listed for the base engine below:
+
+- **Cold-start pipeline**: material in transit *before* the horizon starts is assumed zero unless `initial_pipeline` is supplied explicitly — likely understating early-period throughput for any node with `production_delay > 0`. A real deployment would seed this from actual open purchase orders.
+- **End-of-horizon effect**: a shipment departing in the last `offset[i]` periods of the horizon never arrives in time to be counted — a standard rolling-horizon artifact. A full rolling re-solve (re-optimizing a sliding window and only committing the first period's decisions) is out of scope here.
+- **MIP scale growth**: every variable is now indexed by period, so model size grows linearly with `n_periods` — keep demonstrations at simple/medium/complex scale, not planet-scale.
+- **Fixed-radius disaggregation scope**: `disaggregation_scope` uses a fixed hop count, not a principled dual-based selection (e.g. "restore anything with a material dual value above some threshold"). MIP duals aren't well-defined without relaxing integrality on the aggregate solve, so dual-based scope selection is future work, not implemented here.
+- **One-directional, optimistic aggregation error**: pooling capacity/inventory and taking the union of members' edges only ever *loosens* constraints relative to the true network — a pure-aggregate result should be read as "at least this good," never as a conservative bound. This is exactly why disaggregation restores full fidelity around any actually-disrupted node rather than trusting the aggregate number there.
+- **Single-objective scope**: only the TTR-style "minimize lost profit" objective is implemented in time-phased form; the same Sets/Params/Vars/Objective/Constraints skeleton generalizes to the other 8 objectives in `scripts/utils.py` if ever needed, but that generalization isn't implemented here.
+
 ### How to run
 
-Run `05_realistic_operational_data` to generate the four datasets, then `06_realistic_stress_testing (simple and medium)` (single-node, direct-loop style, mirrors `02`) and `07_realistic_stress_testing (complex network)` (Ray-distributed, mirrors `03`). Tests for the generators and scenario library live in `tests/test_realistic_scenarios.py` — run with `python -m pytest tests/ -v` from the repo root (requires Python 3.12 for the `pyomo`/`highspy` wheels pinned in `uv.lock`).
+Run `05_realistic_operational_data` to generate the four datasets, then `06_realistic_stress_testing (simple and medium)` (single-node, direct-loop style, mirrors `02`), `07_realistic_stress_testing (complex network)` (Ray-distributed, mirrors `03`), and `08_multi_period_planning` (single-node, time-phased planning + network decomposition, mirrors `06`'s cluster spec). Tests for the generators and scenario library live in `tests/test_realistic_scenarios.py`; tests for the time-phased engine and network decomposition live in `tests/test_multi_period_planning.py` — run either with `python -m pytest tests/ -v` from the repo root (requires Python 3.12 for the `pyomo`/`highspy` wheels pinned in `uv.lock`).
 
 `07`'s "Optional: Planet-Scale Sample Sweep" section is controlled by a `run_planet_scale` notebook widget (`"yes"`/`"no"`, default `"yes"`) — set it to `"no"` (via the notebook UI or a job's `base_parameters`) to skip the ~76,000-node sweep and only run the main ~2,300-node complex pipeline.
 

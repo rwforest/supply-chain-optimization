@@ -43,6 +43,11 @@ class IndustryProfile:
     unit_cost_hi: float
     emissions_lo: float  # tier-1 baseline emissions-per-unit band
     emissions_hi: float
+    # Opt-in band for scripts.multi_period_planning's seasonal demand
+    # multiplier (see sample_seasonality_index below) — defaulted so none of
+    # the four INDUSTRY_PROFILES entries below need to be edited to add it.
+    seasonality_amplitude_lo: float = 0.05
+    seasonality_amplitude_hi: float = 0.25
 
 
 INDUSTRY_PROFILES: dict[str, IndustryProfile] = {
@@ -102,6 +107,37 @@ def sample_tier1_params(
         s[node] = max(1, round(demand * dos))
         c[node] = max(demand, round(demand * (1 + headroom)))
     return f, s, d, c
+
+
+def sample_seasonality_index(
+    rng: random.Random,
+    tier1: list[str],
+    n_periods: int,
+    industry_profile: str,
+    amplitude_lo: float | None = None,
+    amplitude_hi: float | None = None,
+) -> dict[str, list[float]]:
+    """Sample a per-tier1-node sinusoidal demand multiplier over
+    ``n_periods``, mean 1.0, for ``scripts.multi_period_planning``'s
+    ``default_periodic_demand(..., seasonality=...)``. Each node gets its own
+    random amplitude (drawn from the industry profile's
+    ``seasonality_amplitude_lo/hi`` band, unless overridden here) and phase,
+    so nodes don't all peak/trough in lockstep. Opt-in only — omitting
+    ``seasonality`` in ``default_periodic_demand`` keeps today's flat-repeat
+    behavior."""
+    profile = INDUSTRY_PROFILES[industry_profile]
+    lo = profile.seasonality_amplitude_lo if amplitude_lo is None else amplitude_lo
+    hi = profile.seasonality_amplitude_hi if amplitude_hi is None else amplitude_hi
+
+    seasonality: dict[str, list[float]] = {}
+    for node in tier1:
+        amplitude = rng.uniform(lo, hi)
+        phase = rng.uniform(0, 2 * math.pi)
+        seasonality[node] = [
+            1.0 + amplitude * math.sin(2 * math.pi * t / n_periods + phase)
+            for t in range(n_periods)
+        ]
+    return seasonality
 
 
 def compute_required_throughput(

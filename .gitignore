@@ -154,3 +154,13 @@ frontend_application/frontend/yarn-debug.log*
 frontend_application/frontend/yarn-error.log*
 frontend_application/frontend/build-chat-app/
 .DS_Store
+
+# Local agent / IDE tooling config (not part of the repo)
+.agents/
+.ai-dev-kit/
+.claude/
+.codex/
+.cursor/
+.gemini/
+.mcp.json
+GEMINI.md
