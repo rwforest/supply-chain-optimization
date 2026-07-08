@@ -46,62 +46,21 @@ The complex-tier networks anchor tier 2 (direct component/module suppliers) and 
 
 > **Every numeric figure attached to a node in this accelerator — profit margin, inventory, demand, capacity — is synthetic and illustrative.** None of these figures represent actual disclosed financial or operational data from Nvidia, Apple, or any named supplier, and must not be used to draw real inferences about those companies. The simple and medium tiers use entirely fictional company names for the same reason.
 
-### Calibration methodology
+### Deep-dive documentation
 
-Rather than sampling every parameter independently, `scripts/scenario_calibration.py` propagates tier-1 demand down through the bill of materials (`compute_required_throughput`) and sizes each supplier's inventory/capacity off of its actual downstream load and a criticality tag (`monopoly_bottleneck`, `oligopoly`, or `diversified_commodity`) — a sole, hard-to-replace supplier naturally ends up with a thin inventory buffer and tight capacity headroom, while a diversified commodity supplier gets generous buffers, without hand-picking which node ID gets bad numbers. Tier-1 demand is drawn from a right-skewed (lognormal) distribution rather than uniform. These patterns are qualitatively inspired by the public [Kaggle "DataCo Smart Supply Chain" dataset](https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis) (skewed order volumes, clustered margin bands) — there is **no runtime dependency on Kaggle credentials or a live download**; the parameters are hand-calibrated constants, documented in that module, so the notebooks stay reproducible without external credentials or guaranteed internet egress.
+The mechanics of *what* gets optimized, *what* breaks, and the newer Adexa-inspired capabilities are documented in dedicated guides under [`docs/`](docs/):
 
-### Disruption-scenario library
-
-`scripts/disruption_scenarios.py` replaces "one random node, one random recovery time" with named, first-class scenarios:
-
-| Type | Description |
+| Guide | Covers |
 |---|---|
-| Single-supplier failure | The original baseline — one node at a time |
-| Regional disruption | Every supplier tagged with a region fails at once (requires a dataset with `region` tags — medium or complex tier) |
-| Material-wide shortage | Every supplier of one material type fails at once |
+| **[Optimization Objectives](docs/optimization-objectives.md)** | All 9 objectives — the original **TTR** & **TTS**, the 6 added LP objectives (`cost_min`, `revenue_max`, `inventory_opt`, `lead_time_min`, `fulfillment_rate`, `carbon_min`), and the structural `network_resilience` metric — with each objective function, its required fields, and caveats. |
+| **[Disruption Scenarios & Calibration](docs/disruption-scenarios.md)** | The 3 scenario *types* (single-supplier / regional / material-wide), the named real-world events, the structure-driven calibration methodology, and the modeling caveats. |
+| **[Multi-Period Planning & Network Decomposition](docs/multi-period-and-decomposition.md)** | The two Adexa-inspired additive modules: time-phased multi-period planning (lead-time offsets, inventory carryover, per-period disruption windows) and aggregate/disaggregate decomposition. |
 
-A handful of the regional/material scenarios are inspired by real historical events (each carries a citation in `real_world_basis`): the 2021 Taiwan drought, the 2022 Shanghai COVID-19 lockdown, the 2011 Thailand floods, a hypothetical EUV-equipment export halt (modeled on 2018-2024 US-China semiconductor export controls), and the 2024-2025 HBM memory capacity crunch. `named_real_world_scenarios(dataset)` only returns the events whose target region/material is actually present in the given dataset.
+**Objectives, in brief:** `scripts/utils.py` has **8 `build_and_solve_*` LP objectives** (TTR + TTS + 6 added) plus **1 non-LP structural metric** (`compute_network_resilience_metrics`) = **9 total**. All 6 added objectives are purely additive — they reuse the `_prep_lp_data` skeleton and never modify `ttr`/`tts`. See the [objectives guide](docs/optimization-objectives.md) for the full breakdown.
 
-### Modeling caveat
+**Scenarios, in brief:** `scripts/disruption_scenarios.py` replaces "one random node, one random recovery time" with named single-supplier, regional, and material-wide failures — several anchored on real historical events (2021 Taiwan drought, 2022 Shanghai lockdown, 2011 Thailand floods, an EUV-export-halt scenario, the 2024-25 HBM crunch). Network parameters are calibrated from BOM structure and per-node criticality tags rather than independent randomness. See the [scenarios guide](docs/disruption-scenarios.md).
 
-The flow-balance constraint in the (unmodified) LP lets a disrupted node keep shipping from its pre-existing on-hand inventory even though its own production is halted — and that inventory is a *fixed* quantity, not scaled by how long the disruption lasts. A short disruption at a well-stocked node can show zero measurable impact while a longer one at the same node shows real impact; this is expected behavior of the underlying model, not a bug. Separately, `run_scenario_tts` normalizes an "unbounded" TTS solver result (the network has enough redundancy/headroom to absorb the disruption indefinitely) to `tts = inf`, since the solver's raw objective value in that case is a meaningless artifact of wherever the simplex method stopped, not a real bound.
-
-### Time-Phased Multi-Period Planning & Network Decomposition
-
-`build_and_solve_ttr`/`build_and_solve_tts` (and the 8 objective variants alongside them) are all **single-snapshot** LPs: one scalar horizon `t`, a disruption that's either on or off for the whole horizon, and no notion of a shipment departing now and arriving later. `scripts/multi_period_planning.py` and `scripts/network_aggregation.py` add two **new, additive** capabilities modeled after Adexa's two biggest structural advantages over that kind of model — neither module modifies `scripts/utils.py`, `scripts/disruption_scenarios.py`, `scripts/realistic_topologies.py`, `scripts/dataset_io.py`, or `scripts/company_profiles.py`; both reuse them read-only (`_prep_lp_data`, `derive_indexes`). See `08_multi_period_planning.ipynb` for a runnable walkthrough of everything below.
-
-**Schema additions** (all optional — omitting them keeps every existing notebook/test unaffected):
-
-| Field | Shape | Used by |
-|---|---|---|
-| `production_delay` | `{node: lead_time_days}` | Lead-time offset (`offset[i] = ceil(production_delay[i] / period_length_days)`) |
-| `unit_cost`, `holding_cost`, `emissions_factor` | `{node: value}` | Not consumed by the time-phased TTR objective itself; calibrated by `scenario_calibration.calibrate_cost_fields` for parity with the other LP objectives |
-| `transport_emissions` | `{(src, tgt): value}` | Same as above |
-
-`TimePhasedDisruption` replaces a scalar `ttr` with a `period_start`/`duration_periods` window on a discrete period axis — `from_legacy_scenario` converts an existing `DisruptionScenario` (`duration_periods = ceil(ttr / period_length_days)`, never rounded down).
-
-**Lead-time-offset worked example:** a supplier with `production_delay = 14` days at `period_length_days = 7` has `offset = 2` — a shipment departing that supplier in period `t` can only satisfy downstream demand starting period `t + 2`. With zero pre-horizon in-transit inventory (the default — see limitations below), the first 2 periods of a cold-started network show full lost demand for anything sourced exclusively from that supplier, then recovery once the first shipment arrives.
-
-**Aggregate/disaggregate decomposition** (`scripts/network_aggregation.py`, modeled after Adexa's Strategic Network Optimizer): `build_aggregate_dataset` pools tier-3 nodes sharing the same `(supplier_material_type, criticality)` into one synthetic group node (`c_agg = Σc_i`, `s_agg = Σs_i`, edges = union of members'). `monopoly_bottleneck` nodes are never pooled — an aggregate node can't be "35% disrupted," and pooling away the network's actual single points of failure would defeat the point of this whole accelerator. `disaggregation_scope` determines which real nodes must be restored to full fidelity for a given disruption: (1) the disrupted node's entire group, always; (2) its downstream consumer cone, `expansion_hops` deep (default 1); (3) its upstream alternate suppliers (the other members of every `P[j][k]` the disrupted node belongs to as a supplier). `run_aggregate_then_disaggregate` orchestrates solve-aggregate → compute scope → rebuild mixed-fidelity dataset → re-solve.
-
-Benchmark (medium dataset, ~700 nodes, a 4-period disruption at its longest-lead-time node, `n_periods=10`):
-
-| Network variant | Tier-3 nodes | Solve time | `lost_profit` |
-|---|---|---|---|
-| Full | 480 | ~0.94s (direct) | 16778.56 |
-| Aggregate only | 160 | ~0.94s | 16778.56 (matched full in this instance — not guaranteed) |
-| Partial (disaggregated) | 160 | ~0.92s | 16778.56 (matches full exactly) |
-
-The partial solve reproduces the full network's result exactly while operating on a structurally smaller model — but at this particular ~700-node scale, combined aggregate+partial wall-clock (~1.9s) was actually *slower* than one direct full-network solve (~1.4s); HiGHS solve time didn't scale down proportionally with the node-count reduction here. The benefit is expected to grow with network size, not to be a universal speedup at every scale — report timings honestly rather than assuming decomposition always wins.
-
-**Limitations**, in addition to the ones already listed for the base engine below:
-
-- **Cold-start pipeline**: material in transit *before* the horizon starts is assumed zero unless `initial_pipeline` is supplied explicitly — likely understating early-period throughput for any node with `production_delay > 0`. A real deployment would seed this from actual open purchase orders.
-- **End-of-horizon effect**: a shipment departing in the last `offset[i]` periods of the horizon never arrives in time to be counted — a standard rolling-horizon artifact. A full rolling re-solve (re-optimizing a sliding window and only committing the first period's decisions) is out of scope here.
-- **MIP scale growth**: every variable is now indexed by period, so model size grows linearly with `n_periods` — keep demonstrations at simple/medium/complex scale, not planet-scale.
-- **Fixed-radius disaggregation scope**: `disaggregation_scope` uses a fixed hop count, not a principled dual-based selection (e.g. "restore anything with a material dual value above some threshold"). MIP duals aren't well-defined without relaxing integrality on the aggregate solve, so dual-based scope selection is future work, not implemented here.
-- **One-directional, optimistic aggregation error**: pooling capacity/inventory and taking the union of members' edges only ever *loosens* constraints relative to the true network — a pure-aggregate result should be read as "at least this good," never as a conservative bound. This is exactly why disaggregation restores full fidelity around any actually-disrupted node rather than trusting the aggregate number there.
-- **Single-objective scope**: only the TTR-style "minimize lost profit" objective is implemented in time-phased form; the same Sets/Params/Vars/Objective/Constraints skeleton generalizes to the other 8 objectives in `scripts/utils.py` if ever needed, but that generalization isn't implemented here.
+**Multi-period & decomposition, in brief:** `scripts/multi_period_planning.py` and `scripts/network_aggregation.py` add time-phased planning and aggregate/disaggregate decomposition, both modeled after Adexa's structural advantages over a single-snapshot LP and both purely additive (walkthrough in `08_multi_period_planning.ipynb`). See the [multi-period guide](docs/multi-period-and-decomposition.md).
 
 ### How to run
 
