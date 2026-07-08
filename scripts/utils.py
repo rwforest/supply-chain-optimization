@@ -218,6 +218,37 @@ def visualize_network(dataset: dict) -> None:
     plt.show()
 
 
+def _prep_lp_data(dataset: dict, disrupted: list[str]) -> dict:
+    """Shared data-prep for all build_and_solve_* functions: flattens the
+    nested ``r``/``P`` dicts to tuple-keyed dicts and assembles the common
+    set/param inputs every LP variant builds from."""
+    r = {}
+    for j, inner in dataset["r"].items():
+        for k, val in inner.items():
+            r[(k, j)] = val
+
+    P = {}
+    for j, inner in dataset["P"].items():
+        for k, I in inner.items():
+            P[(j, k)] = I
+
+    return {
+        'V': dataset['tier1'],  # product nodes
+        'D': dataset['tier1'] + dataset['tier2'],  # all BUT leaf nodes
+        'U': dataset['tier2'] + dataset['tier3'],  # all BUT product nodes
+        'K': dataset['material_types'],  # material types  (k ∈ 𝒩⁻(j))
+        'S': disrupted,  # disrupted nodes in scenario n
+        'N_minus': dataset['N_minus'],  # materials required to produce node j: dict  j ↦ list_of_k   (𝒩⁻(j))
+        'N_plus': dataset['N_plus'],    # child nodes of node i: dict  i ↦ list_of_j   (𝒩⁺(i))
+        'P': P,             # parent nodes of node j of material type k: dict  (j,k) ↦ list_of_i  (𝒫_{jk})
+        'f': dataset['f'],  # profit margin of 1 unit of j
+        's': dataset['s'],  # inventory of i
+        'd': dataset['d'],  # demand for j per time unit
+        'c': dataset['c'],  # plant capacity per time unit
+        'r': r,             # number of material type k needed for one unit of j
+    }
+
+
 def build_and_solve_ttr(dataset: dict, disrupted: list[str], ttr: float, return_model: bool = False) -> pd.DataFrame:
     import pandas as pd
     import pyomo.environ as pyo
@@ -232,7 +263,7 @@ def build_and_solve_ttr(dataset: dict, disrupted: list[str], ttr: float, return_
     for j, inner in dataset["P"].items():
         for k, I in inner.items():
             P[(j, k)] = I
-    
+
     data = {
         'V': dataset['tier1'],  # product nodes
         'D': dataset['tier1'] + dataset['tier2'],  # all BUT leaf nodes
@@ -247,7 +278,7 @@ def build_and_solve_ttr(dataset: dict, disrupted: list[str], ttr: float, return_
         't': ttr,           # TTR for disruption scenario n (a scalar)
         'd': dataset['d'],  # demand for j per time unit
         'c': dataset['c'],  # plant capacity per time unit
-        'r': r,             # number of material type k needed for one unit of j 
+        'r': r,             # number of material type k needed for one unit of j
     }
 
     # Build the ConcreteModel
@@ -480,14 +511,606 @@ def build_and_solve_tts(dataset: dict, disrupted: list[str], return_model: bool 
     else:
         return pd.DataFrame(
             [[
-                disrupted, 
-                result.solver.termination_condition, 
+                disrupted,
+                result.solver.termination_condition,
                 pyo.value(m.OBJ),
-            ]], 
+            ]],
             columns=[
-                "disrupted", 
-                "termination_condition", 
-                "tts", 
+                "disrupted",
+                "termination_condition",
+                "tts",
                 ],
             )
-        
+
+
+def build_and_solve_cost_min(
+    dataset: dict,
+    disrupted: list[str],
+    ttr: float,
+    fixed_u: dict[str, int] | None = None,
+    fixed_s: dict[str, int] | None = None,
+    return_model: bool = False,
+) -> pd.DataFrame:
+    """Minimize total procurement/production cost (Σ unit_cost[i]·u[i])
+    while still meeting all tier-1 demand over the horizon ``ttr``.
+    Requires ``dataset["unit_cost"]`` (see
+    ``scripts.scenario_calibration.calibrate_cost_fields``)."""
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    data = _prep_lp_data(dataset, disrupted)
+    if fixed_s:
+        data['s'] = {**data['s'], **fixed_s}
+    unit_cost = dataset['unit_cost']
+
+    m = pyo.ConcreteModel()
+
+    m.V = pyo.Set(initialize=data['V'])
+    m.D = pyo.Set(initialize=data['D'])
+    m.U = pyo.Set(initialize=data['U'])
+    m.K = pyo.Set(initialize=data['K'])
+    m.S = pyo.Set(initialize=data['S'])
+
+    m.N_minus = pyo.Set(m.D, initialize=lambda mdl, j: data['N_minus'][j])
+    m.N_plus = pyo.Set(m.U, initialize=lambda mdl, i: data['N_plus'][i])
+
+    m.NODES = pyo.Set(initialize=list(set(data['V']) | set(data['U'])))
+
+    m.P = pyo.Set(dimen=3, initialize=[
+        (i, j, k)
+        for (j, k), I in data['P'].items()
+        for i in I
+    ])
+
+    m.t = pyo.Param(initialize=ttr, within=pyo.PositiveReals)
+    m.s = pyo.Param(m.NODES, initialize=data['s'], within=pyo.NonNegativeIntegers)
+    m.d = pyo.Param(m.V, initialize=data['d'], within=pyo.NonNegativeIntegers)
+    m.c = pyo.Param(m.NODES, initialize=data['c'], within=pyo.NonNegativeIntegers)
+    m.r = pyo.Param(m.K, m.NODES, initialize=data['r'], within=pyo.NonNegativeReals)
+    m.unit_cost = pyo.Param(m.NODES, initialize=unit_cost, within=pyo.NonNegativeReals)
+
+    m.u = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers)
+    m.y_index = pyo.Set(within=m.U * m.NODES, initialize=lambda mdl: [
+        (i, j) for i in mdl.U for j in mdl.N_plus[i]
+    ])
+    m.y = pyo.Var(m.y_index, domain=pyo.NonNegativeIntegers)
+
+    if fixed_u:
+        for i, val in fixed_u.items():
+            m.u[i].fix(val)
+
+    def obj_rule(mdl):
+        return sum(mdl.unit_cost[i] * mdl.u[i] for i in mdl.NODES)
+    m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    def bom_production_rule(mdl, j, k):
+        rhs = sum(mdl.y[i, j] / mdl.r[k, j] for i in data['P'][(j, k)])
+        return mdl.u[j] - rhs <= 0
+    m.BomProduction = pyo.Constraint([(j, k) for j in m.D for k in m.N_minus[j]], rule=bom_production_rule)
+
+    def flow_balance_rule(mdl, i):
+        return sum(mdl.y[i, j] for j in mdl.N_plus[i]) - mdl.u[i] <= mdl.s[i]
+    m.FlowBalance = pyo.Constraint(m.U, rule=flow_balance_rule)
+
+    m.Disrupted = pyo.Constraint(m.S, rule=lambda m, j: m.u[j] == 0)
+
+    def demand_rule(mdl, j):
+        return mdl.u[j] + mdl.s[j] >= mdl.d[j] * mdl.t
+    m.Demand = pyo.Constraint(m.V, rule=demand_rule)
+
+    def capacity_rule(mdl, j):
+        return mdl.u[j] <= mdl.c[j] * mdl.t
+    m.Capacity = pyo.Constraint(m.NODES, rule=capacity_rule)
+
+    solver = pyo.SolverFactory("highs")
+    result = solver.solve(m, tee=False)
+
+    columns = ["disrupted", "ttr", "termination_condition", "total_cost"]
+    row = [disrupted, ttr, result.solver.termination_condition, pyo.value(m.OBJ)]
+    if return_model:
+        columns.append("model")
+        row.append(m)
+    return pd.DataFrame([row], columns=columns)
+
+
+def build_and_solve_revenue_max(
+    dataset: dict,
+    disrupted: list[str],
+    ttr: float,
+    fixed_u: dict[str, int] | None = None,
+    fixed_s: dict[str, int] | None = None,
+    return_model: bool = False,
+) -> pd.DataFrame:
+    """Maximize sales revenue (Σ f[j]·u[j], reusing the existing profit-margin
+    param) subject to a demand cap — production of a finished good can't
+    exceed what can actually be sold (``d[j]*t``)."""
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    data = _prep_lp_data(dataset, disrupted)
+    if fixed_s:
+        data['s'] = {**data['s'], **fixed_s}
+
+    m = pyo.ConcreteModel()
+
+    m.V = pyo.Set(initialize=data['V'])
+    m.D = pyo.Set(initialize=data['D'])
+    m.U = pyo.Set(initialize=data['U'])
+    m.K = pyo.Set(initialize=data['K'])
+    m.S = pyo.Set(initialize=data['S'])
+
+    m.N_minus = pyo.Set(m.D, initialize=lambda mdl, j: data['N_minus'][j])
+    m.N_plus = pyo.Set(m.U, initialize=lambda mdl, i: data['N_plus'][i])
+
+    m.NODES = pyo.Set(initialize=list(set(data['V']) | set(data['U'])))
+
+    m.P = pyo.Set(dimen=3, initialize=[
+        (i, j, k)
+        for (j, k), I in data['P'].items()
+        for i in I
+    ])
+
+    m.t = pyo.Param(initialize=ttr, within=pyo.PositiveReals)
+    m.f = pyo.Param(m.V, initialize=data['f'], within=pyo.NonNegativeReals)
+    m.s = pyo.Param(m.NODES, initialize=data['s'], within=pyo.NonNegativeIntegers)
+    m.d = pyo.Param(m.V, initialize=data['d'], within=pyo.NonNegativeIntegers)
+    m.c = pyo.Param(m.NODES, initialize=data['c'], within=pyo.NonNegativeIntegers)
+    m.r = pyo.Param(m.K, m.NODES, initialize=data['r'], within=pyo.NonNegativeReals)
+
+    m.u = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers)
+    m.y_index = pyo.Set(within=m.U * m.NODES, initialize=lambda mdl: [
+        (i, j) for i in mdl.U for j in mdl.N_plus[i]
+    ])
+    m.y = pyo.Var(m.y_index, domain=pyo.NonNegativeIntegers)
+
+    if fixed_u:
+        for i, val in fixed_u.items():
+            m.u[i].fix(val)
+
+    def obj_rule(mdl):
+        return sum(mdl.f[j] * mdl.u[j] for j in mdl.V)
+    m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.maximize)
+
+    def bom_production_rule(mdl, j, k):
+        rhs = sum(mdl.y[i, j] / mdl.r[k, j] for i in data['P'][(j, k)])
+        return mdl.u[j] - rhs <= 0
+    m.BomProduction = pyo.Constraint([(j, k) for j in m.D for k in m.N_minus[j]], rule=bom_production_rule)
+
+    def flow_balance_rule(mdl, i):
+        return sum(mdl.y[i, j] for j in mdl.N_plus[i]) - mdl.u[i] <= mdl.s[i]
+    m.FlowBalance = pyo.Constraint(m.U, rule=flow_balance_rule)
+
+    m.Disrupted = pyo.Constraint(m.S, rule=lambda m, j: m.u[j] == 0)
+
+    def demand_cap_rule(mdl, j):
+        return mdl.u[j] <= mdl.d[j] * mdl.t
+    m.DemandCap = pyo.Constraint(m.V, rule=demand_cap_rule)
+
+    def capacity_rule(mdl, j):
+        return mdl.u[j] <= mdl.c[j] * mdl.t
+    m.Capacity = pyo.Constraint(m.NODES, rule=capacity_rule)
+
+    solver = pyo.SolverFactory("highs")
+    result = solver.solve(m, tee=False)
+
+    columns = ["disrupted", "ttr", "termination_condition", "revenue"]
+    row = [disrupted, ttr, result.solver.termination_condition, pyo.value(m.OBJ)]
+    if return_model:
+        columns.append("model")
+        row.append(m)
+    return pd.DataFrame([row], columns=columns)
+
+
+def build_and_solve_inventory_opt(
+    dataset: dict,
+    disrupted: list[str],
+    ttr: float,
+    fixed_u: dict[str, int] | None = None,
+    fixed_s: dict[str, int] | None = None,
+    return_model: bool = False,
+) -> pd.DataFrame:
+    """Minimize working capital tied up in inventory (Σ holding_cost[i]·s[i])
+    while still meeting demand, treating on-hand inventory ``s`` as a
+    decision variable bounded above by ``dataset["s"]`` (the calibrated
+    inventory ceiling) rather than a fixed input. Requires
+    ``dataset["holding_cost"]``."""
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    data = _prep_lp_data(dataset, disrupted)
+    s_max = data['s']
+    holding_cost = dataset['holding_cost']
+
+    m = pyo.ConcreteModel()
+
+    m.V = pyo.Set(initialize=data['V'])
+    m.D = pyo.Set(initialize=data['D'])
+    m.U = pyo.Set(initialize=data['U'])
+    m.K = pyo.Set(initialize=data['K'])
+    m.S = pyo.Set(initialize=data['S'])
+
+    m.N_minus = pyo.Set(m.D, initialize=lambda mdl, j: data['N_minus'][j])
+    m.N_plus = pyo.Set(m.U, initialize=lambda mdl, i: data['N_plus'][i])
+
+    m.NODES = pyo.Set(initialize=list(set(data['V']) | set(data['U'])))
+
+    m.P = pyo.Set(dimen=3, initialize=[
+        (i, j, k)
+        for (j, k), I in data['P'].items()
+        for i in I
+    ])
+
+    m.t = pyo.Param(initialize=ttr, within=pyo.PositiveReals)
+    m.s_max = pyo.Param(m.NODES, initialize=s_max, within=pyo.NonNegativeIntegers)
+    m.d = pyo.Param(m.V, initialize=data['d'], within=pyo.NonNegativeIntegers)
+    m.c = pyo.Param(m.NODES, initialize=data['c'], within=pyo.NonNegativeIntegers)
+    m.r = pyo.Param(m.K, m.NODES, initialize=data['r'], within=pyo.NonNegativeReals)
+    m.holding_cost = pyo.Param(m.NODES, initialize=holding_cost, within=pyo.NonNegativeReals)
+
+    m.u = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers)
+    m.s = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers, bounds=lambda mdl, i: (0, s_max[i]))
+    m.y_index = pyo.Set(within=m.U * m.NODES, initialize=lambda mdl: [
+        (i, j) for i in mdl.U for j in mdl.N_plus[i]
+    ])
+    m.y = pyo.Var(m.y_index, domain=pyo.NonNegativeIntegers)
+
+    if fixed_u:
+        for i, val in fixed_u.items():
+            m.u[i].fix(val)
+    if fixed_s:
+        for i, val in fixed_s.items():
+            m.s[i].fix(val)
+
+    def obj_rule(mdl):
+        return sum(mdl.holding_cost[i] * mdl.s[i] for i in mdl.NODES)
+    m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    def bom_production_rule(mdl, j, k):
+        rhs = sum(mdl.y[i, j] / mdl.r[k, j] for i in data['P'][(j, k)])
+        return mdl.u[j] - rhs <= 0
+    m.BomProduction = pyo.Constraint([(j, k) for j in m.D for k in m.N_minus[j]], rule=bom_production_rule)
+
+    def flow_balance_rule(mdl, i):
+        return sum(mdl.y[i, j] for j in mdl.N_plus[i]) - mdl.u[i] <= mdl.s[i]
+    m.FlowBalance = pyo.Constraint(m.U, rule=flow_balance_rule)
+
+    m.Disrupted = pyo.Constraint(m.S, rule=lambda m, j: m.u[j] == 0)
+
+    def demand_rule(mdl, j):
+        return mdl.u[j] + mdl.s[j] >= mdl.d[j] * mdl.t
+    m.Demand = pyo.Constraint(m.V, rule=demand_rule)
+
+    def capacity_rule(mdl, j):
+        return mdl.u[j] <= mdl.c[j] * mdl.t
+    m.Capacity = pyo.Constraint(m.NODES, rule=capacity_rule)
+
+    solver = pyo.SolverFactory("highs")
+    result = solver.solve(m, tee=False)
+
+    columns = ["disrupted", "ttr", "termination_condition", "holding_cost_total"]
+    row = [disrupted, ttr, result.solver.termination_condition, pyo.value(m.OBJ)]
+    if return_model:
+        columns.append("model")
+        row.append(m)
+    return pd.DataFrame([row], columns=columns)
+
+
+def build_and_solve_lead_time_min(
+    dataset: dict,
+    disrupted: list[str],
+    ttr: float,
+    fixed_u: dict[str, int] | None = None,
+    fixed_s: dict[str, int] | None = None,
+    return_model: bool = False,
+) -> pd.DataFrame:
+    """Minimize delay-weighted production allocation (Σ production_delay[i]·u[i])
+    subject to material availability, as a proxy for lead-time/cycle-time
+    reduction. This is a simplification: it approximates lead-time
+    reduction as which nodes carry production volume, not a full
+    critical-path/project-scheduling model of actual elapsed time. Requires
+    ``dataset["production_delay"]``."""
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    data = _prep_lp_data(dataset, disrupted)
+    if fixed_s:
+        data['s'] = {**data['s'], **fixed_s}
+    production_delay = dataset['production_delay']
+
+    m = pyo.ConcreteModel()
+
+    m.V = pyo.Set(initialize=data['V'])
+    m.D = pyo.Set(initialize=data['D'])
+    m.U = pyo.Set(initialize=data['U'])
+    m.K = pyo.Set(initialize=data['K'])
+    m.S = pyo.Set(initialize=data['S'])
+
+    m.N_minus = pyo.Set(m.D, initialize=lambda mdl, j: data['N_minus'][j])
+    m.N_plus = pyo.Set(m.U, initialize=lambda mdl, i: data['N_plus'][i])
+
+    m.NODES = pyo.Set(initialize=list(set(data['V']) | set(data['U'])))
+
+    m.P = pyo.Set(dimen=3, initialize=[
+        (i, j, k)
+        for (j, k), I in data['P'].items()
+        for i in I
+    ])
+
+    m.t = pyo.Param(initialize=ttr, within=pyo.PositiveReals)
+    m.s = pyo.Param(m.NODES, initialize=data['s'], within=pyo.NonNegativeIntegers)
+    m.d = pyo.Param(m.V, initialize=data['d'], within=pyo.NonNegativeIntegers)
+    m.c = pyo.Param(m.NODES, initialize=data['c'], within=pyo.NonNegativeIntegers)
+    m.r = pyo.Param(m.K, m.NODES, initialize=data['r'], within=pyo.NonNegativeReals)
+    m.production_delay = pyo.Param(m.NODES, initialize=production_delay, within=pyo.NonNegativeReals)
+
+    m.u = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers)
+    m.y_index = pyo.Set(within=m.U * m.NODES, initialize=lambda mdl: [
+        (i, j) for i in mdl.U for j in mdl.N_plus[i]
+    ])
+    m.y = pyo.Var(m.y_index, domain=pyo.NonNegativeIntegers)
+
+    if fixed_u:
+        for i, val in fixed_u.items():
+            m.u[i].fix(val)
+
+    def obj_rule(mdl):
+        return sum(mdl.production_delay[i] * mdl.u[i] for i in mdl.NODES)
+    m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    def bom_production_rule(mdl, j, k):
+        rhs = sum(mdl.y[i, j] / mdl.r[k, j] for i in data['P'][(j, k)])
+        return mdl.u[j] - rhs <= 0
+    m.BomProduction = pyo.Constraint([(j, k) for j in m.D for k in m.N_minus[j]], rule=bom_production_rule)
+
+    def flow_balance_rule(mdl, i):
+        return sum(mdl.y[i, j] for j in mdl.N_plus[i]) - mdl.u[i] <= mdl.s[i]
+    m.FlowBalance = pyo.Constraint(m.U, rule=flow_balance_rule)
+
+    m.Disrupted = pyo.Constraint(m.S, rule=lambda m, j: m.u[j] == 0)
+
+    def demand_rule(mdl, j):
+        return mdl.u[j] + mdl.s[j] >= mdl.d[j] * mdl.t
+    m.Demand = pyo.Constraint(m.V, rule=demand_rule)
+
+    def capacity_rule(mdl, j):
+        return mdl.u[j] <= mdl.c[j] * mdl.t
+    m.Capacity = pyo.Constraint(m.NODES, rule=capacity_rule)
+
+    solver = pyo.SolverFactory("highs")
+    result = solver.solve(m, tee=False)
+
+    columns = ["disrupted", "ttr", "termination_condition", "total_delay"]
+    row = [disrupted, ttr, result.solver.termination_condition, pyo.value(m.OBJ)]
+    if return_model:
+        columns.append("model")
+        row.append(m)
+    return pd.DataFrame([row], columns=columns)
+
+
+def build_and_solve_fulfillment_rate(
+    dataset: dict,
+    disrupted: list[str],
+    ttr: float,
+    fixed_u: dict[str, int] | None = None,
+    fixed_s: dict[str, int] | None = None,
+    return_model: bool = False,
+) -> pd.DataFrame:
+    """Maximize the average demand-fulfillment rate by minimizing normalized
+    lost-volume fraction (Σ l[j] / (d[j]·t)), equivalent to maximizing
+    Σ(units_delivered/d). Unlike ``build_and_solve_ttr`` (which weights lost
+    volume by profit margin), this weights every unit of unmet demand
+    equally regardless of which product it belongs to."""
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    data = _prep_lp_data(dataset, disrupted)
+    if fixed_s:
+        data['s'] = {**data['s'], **fixed_s}
+
+    m = pyo.ConcreteModel()
+
+    m.V = pyo.Set(initialize=data['V'])
+    m.D = pyo.Set(initialize=data['D'])
+    m.U = pyo.Set(initialize=data['U'])
+    m.K = pyo.Set(initialize=data['K'])
+    m.S = pyo.Set(initialize=data['S'])
+
+    m.N_minus = pyo.Set(m.D, initialize=lambda mdl, j: data['N_minus'][j])
+    m.N_plus = pyo.Set(m.U, initialize=lambda mdl, i: data['N_plus'][i])
+
+    m.NODES = pyo.Set(initialize=list(set(data['V']) | set(data['U'])))
+
+    m.P = pyo.Set(dimen=3, initialize=[
+        (i, j, k)
+        for (j, k), I in data['P'].items()
+        for i in I
+    ])
+
+    m.t = pyo.Param(initialize=ttr, within=pyo.PositiveReals)
+    m.s = pyo.Param(m.NODES, initialize=data['s'], within=pyo.NonNegativeIntegers)
+    m.d = pyo.Param(m.V, initialize=data['d'], within=pyo.NonNegativeIntegers)
+    m.c = pyo.Param(m.NODES, initialize=data['c'], within=pyo.NonNegativeIntegers)
+    m.r = pyo.Param(m.K, m.NODES, initialize=data['r'], within=pyo.NonNegativeReals)
+
+    m.u = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers)
+    m.l = pyo.Var(m.V, domain=pyo.NonNegativeIntegers)
+    m.y_index = pyo.Set(within=m.U * m.NODES, initialize=lambda mdl: [
+        (i, j) for i in mdl.U for j in mdl.N_plus[i]
+    ])
+    m.y = pyo.Var(m.y_index, domain=pyo.NonNegativeIntegers)
+
+    if fixed_u:
+        for i, val in fixed_u.items():
+            m.u[i].fix(val)
+
+    def obj_rule(mdl):
+        return sum(mdl.l[j] / (mdl.d[j] * mdl.t) for j in mdl.V)
+    m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    def bom_production_rule(mdl, j, k):
+        rhs = sum(mdl.y[i, j] / mdl.r[k, j] for i in data['P'][(j, k)])
+        return mdl.u[j] - rhs <= 0
+    m.BomProduction = pyo.Constraint([(j, k) for j in m.D for k in m.N_minus[j]], rule=bom_production_rule)
+
+    def flow_balance_rule(mdl, i):
+        return sum(mdl.y[i, j] for j in mdl.N_plus[i]) - mdl.u[i] <= mdl.s[i]
+    m.FlowBalance = pyo.Constraint(m.U, rule=flow_balance_rule)
+
+    m.Disrupted = pyo.Constraint(m.S, rule=lambda m, j: m.u[j] == 0)
+
+    def demand_rule(mdl, j):
+        return mdl.l[j] + mdl.u[j] + mdl.s[j] >= mdl.d[j] * mdl.t
+    m.Demand = pyo.Constraint(m.V, rule=demand_rule)
+
+    def capacity_rule(mdl, j):
+        return mdl.u[j] <= mdl.c[j] * mdl.t
+    m.Capacity = pyo.Constraint(m.NODES, rule=capacity_rule)
+
+    solver = pyo.SolverFactory("highs")
+    result = solver.solve(m, tee=False)
+
+    columns = ["disrupted", "ttr", "termination_condition", "lost_fraction"]
+    row = [disrupted, ttr, result.solver.termination_condition, pyo.value(m.OBJ)]
+    if return_model:
+        columns.append("model")
+        row.append(m)
+    return pd.DataFrame([row], columns=columns)
+
+
+def build_and_solve_carbon_min(
+    dataset: dict,
+    disrupted: list[str],
+    ttr: float,
+    fixed_u: dict[str, int] | None = None,
+    fixed_s: dict[str, int] | None = None,
+    return_model: bool = False,
+) -> pd.DataFrame:
+    """Minimize environmental impact (Σ emissions_factor[i]·u[i] +
+    Σ transport_emissions[i,j]·y[i,j]) while still meeting demand. Requires
+    ``dataset["emissions_factor"]`` and ``dataset["transport_emissions"]``
+    (the latter keyed by ``(src, tgt)`` edge tuples)."""
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    data = _prep_lp_data(dataset, disrupted)
+    if fixed_s:
+        data['s'] = {**data['s'], **fixed_s}
+    emissions_factor = dataset['emissions_factor']
+    transport_emissions = dataset['transport_emissions']
+
+    m = pyo.ConcreteModel()
+
+    m.V = pyo.Set(initialize=data['V'])
+    m.D = pyo.Set(initialize=data['D'])
+    m.U = pyo.Set(initialize=data['U'])
+    m.K = pyo.Set(initialize=data['K'])
+    m.S = pyo.Set(initialize=data['S'])
+
+    m.N_minus = pyo.Set(m.D, initialize=lambda mdl, j: data['N_minus'][j])
+    m.N_plus = pyo.Set(m.U, initialize=lambda mdl, i: data['N_plus'][i])
+
+    m.NODES = pyo.Set(initialize=list(set(data['V']) | set(data['U'])))
+
+    m.P = pyo.Set(dimen=3, initialize=[
+        (i, j, k)
+        for (j, k), I in data['P'].items()
+        for i in I
+    ])
+
+    m.t = pyo.Param(initialize=ttr, within=pyo.PositiveReals)
+    m.s = pyo.Param(m.NODES, initialize=data['s'], within=pyo.NonNegativeIntegers)
+    m.d = pyo.Param(m.V, initialize=data['d'], within=pyo.NonNegativeIntegers)
+    m.c = pyo.Param(m.NODES, initialize=data['c'], within=pyo.NonNegativeIntegers)
+    m.r = pyo.Param(m.K, m.NODES, initialize=data['r'], within=pyo.NonNegativeReals)
+    m.emissions_factor = pyo.Param(m.NODES, initialize=emissions_factor, within=pyo.NonNegativeReals)
+
+    m.u = pyo.Var(m.NODES, domain=pyo.NonNegativeIntegers)
+    m.y_index = pyo.Set(within=m.U * m.NODES, initialize=lambda mdl: [
+        (i, j) for i in mdl.U for j in mdl.N_plus[i]
+    ])
+    m.y = pyo.Var(m.y_index, domain=pyo.NonNegativeIntegers)
+    m.transport_emissions = pyo.Param(
+        m.y_index,
+        initialize=lambda mdl, i, j: transport_emissions.get((i, j), 0.0),
+        within=pyo.NonNegativeReals,
+    )
+
+    if fixed_u:
+        for i, val in fixed_u.items():
+            m.u[i].fix(val)
+
+    def obj_rule(mdl):
+        production_emissions = sum(mdl.emissions_factor[i] * mdl.u[i] for i in mdl.NODES)
+        transport = sum(mdl.transport_emissions[i, j] * mdl.y[i, j] for (i, j) in mdl.y_index)
+        return production_emissions + transport
+    m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    def bom_production_rule(mdl, j, k):
+        rhs = sum(mdl.y[i, j] / mdl.r[k, j] for i in data['P'][(j, k)])
+        return mdl.u[j] - rhs <= 0
+    m.BomProduction = pyo.Constraint([(j, k) for j in m.D for k in m.N_minus[j]], rule=bom_production_rule)
+
+    def flow_balance_rule(mdl, i):
+        return sum(mdl.y[i, j] for j in mdl.N_plus[i]) - mdl.u[i] <= mdl.s[i]
+    m.FlowBalance = pyo.Constraint(m.U, rule=flow_balance_rule)
+
+    m.Disrupted = pyo.Constraint(m.S, rule=lambda m, j: m.u[j] == 0)
+
+    def demand_rule(mdl, j):
+        return mdl.u[j] + mdl.s[j] >= mdl.d[j] * mdl.t
+    m.Demand = pyo.Constraint(m.V, rule=demand_rule)
+
+    def capacity_rule(mdl, j):
+        return mdl.u[j] <= mdl.c[j] * mdl.t
+    m.Capacity = pyo.Constraint(m.NODES, rule=capacity_rule)
+
+    solver = pyo.SolverFactory("highs")
+    result = solver.solve(m, tee=False)
+
+    columns = ["disrupted", "ttr", "termination_condition", "total_emissions"]
+    row = [disrupted, ttr, result.solver.termination_condition, pyo.value(m.OBJ)]
+    if return_model:
+        columns.append("model")
+        row.append(m)
+    return pd.DataFrame([row], columns=columns)
+
+
+def compute_network_resilience_metrics(dataset: dict) -> dict:
+    """Compute topology-level resilience metrics directly from the dataset's
+    bill-of-materials structure (``P``, ``N_minus``) — this is a structural
+    property of the network, not a flow-allocation problem, so unlike the
+    other new objectives it is not a Pyomo solve.
+
+    Returns a dict with:
+      - ``single_point_of_failure_pairs``: count of (node, material) pairs
+        with exactly one supplier.
+      - ``avg_suppliers_per_material``: mean supplier count across all
+        (node, material) pairs.
+      - ``resilience_score``: per-node dict, the minimum supplier count
+        across that node's own (node, material) pairs (a node with any
+        single-sourced material has a score of 1); nodes with no BOM
+        requirements (leaf tier-3 nodes) are omitted.
+    """
+    P = dataset["P"]
+    supplier_counts = []
+    resilience_score: dict[str, int] = {}
+
+    for j, materials in P.items():
+        node_min = None
+        for k, suppliers in materials.items():
+            n_suppliers = len(suppliers)
+            supplier_counts.append(n_suppliers)
+            node_min = n_suppliers if node_min is None else min(node_min, n_suppliers)
+        if node_min is not None:
+            resilience_score[j] = node_min
+
+    single_point_of_failure_pairs = sum(1 for n in supplier_counts if n == 1)
+    avg_suppliers_per_material = (
+        sum(supplier_counts) / len(supplier_counts) if supplier_counts else 0.0
+    )
+
+    return {
+        "single_point_of_failure_pairs": single_point_of_failure_pairs,
+        "avg_suppliers_per_material": avg_suppliers_per_material,
+        "resilience_score": resilience_score,
+    }
