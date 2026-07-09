@@ -212,6 +212,16 @@ def test_generate_complex_network_at_scale_presets():
         rt.generate_complex_network_at_scale("apple", scale="not_a_real_preset")
 
 
+def test_generate_complex_network_at_scale_mps_planet():
+    """The MPS anchor supports the planet preset just like nvidia/apple — the
+    dataset stays schema-valid and is meaningfully larger than complex scale."""
+    planet = rt.generate_complex_network_at_scale("mps", scale="planet")
+    assert REQUIRED_KEYS.issubset(planet.keys())
+    complex_mps = rt.generate_complex_network("mps")
+    assert len(planet["tier2"]) > len(complex_mps["tier2"])
+    assert len(planet["tier3"]) > len(complex_mps["tier3"])
+
+
 def test_single_supplier_failure_scenarios_exhaustive_by_default(datasets):
     """sample_fraction=1.0 (the default) produces the exact same scenario
     set as today — one per tier2+tier3 node — regression guard."""

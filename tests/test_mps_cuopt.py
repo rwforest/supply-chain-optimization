@@ -28,11 +28,7 @@ import scripts.realistic_topologies as rt
 import scripts.scenario_calibration as sc
 
 
-@pytest.fixture(scope="module")
-def mps_dataset():
-    """A generated MPS network with cost/holding/delay/emissions fields merged
-    in, exactly as the `09` notebook assembles it before deriving models."""
-    d = rt.generate_complex_network("mps")
+def _with_cost_fields(d: dict) -> dict:
     rng = random.Random(7)
     fields = sc.calibrate_cost_fields(
         rng,
@@ -42,6 +38,21 @@ def mps_dataset():
         region=d.get("region"),
     )
     return {**d, **fields}
+
+
+@pytest.fixture(scope="module")
+def mps_dataset():
+    """A generated MPS network with cost/holding/delay/emissions fields merged
+    in, exactly as the `09` notebook assembles it before deriving models."""
+    return _with_cost_fields(rt.generate_complex_network("mps"))
+
+
+@pytest.fixture(scope="module")
+def mps_planet_dataset():
+    """The planet-scale (~76k-node) MPS network, for confirming the pipeline
+    stays tractable there (FJSP machines / CVRPTW depots scale-invariant, MEIO
+    subsampled)."""
+    return _with_cost_fields(rt.generate_complex_network_at_scale("mps", scale="planet"))
 
 
 # --------------------------------------------------------------------------
@@ -251,6 +262,63 @@ def test_meio_tangent_free_true_cost_matches_manual():
     per_node = {"a": {"net_lead_time": 4.0}, "b": {"net_lead_time": 9.0}}
     expected = 2.0 * 1.645 * 10.0 * math.sqrt(4.0) + 3.0 * 2.326 * 20.0 * math.sqrt(9.0)
     assert meio.true_safety_stock_cost(net, per_node) == pytest.approx(expected, rel=1e-6)
+
+
+# --------------------------------------------------------------------------
+# Planet scale (~76k nodes) — the pipeline must stay tractable
+# --------------------------------------------------------------------------
+def test_fjsp_machines_are_scale_invariant(mps_dataset, mps_planet_dataset):
+    """FJSP models MPS's OWN back-end facilities, so the machine set is keyed
+    off the real named anchors and must NOT grow with the synthetic fan-out —
+    otherwise the MILP explodes at planet scale."""
+    complex_machines = md.select_backend_machines(mps_dataset)
+    planet_machines = md.select_backend_machines(mps_planet_dataset)
+    assert len(complex_machines) == len(planet_machines)
+    # depots likewise (Chengdu + Penang only, no synthetic peers)
+    assert len(md.select_cvrptw_depots(mps_dataset)) == len(
+        md.select_cvrptw_depots(mps_planet_dataset)
+    )
+
+
+def test_meio_default_keeps_full_network(mps_dataset):
+    """Backward-compat: with no sampling args, every tier node is kept."""
+    net = md.derive_meio_network(mps_dataset)
+    expected = set(mps_dataset["tier1"] + mps_dataset["tier2"] + mps_dataset["tier3"])
+    assert set(net["nodes"]) == expected
+
+
+def test_meio_planet_sampling_keeps_anchors_and_stays_bounded(mps_planet_dataset):
+    """Planet-scale MEIO subsamples to max_nodes while always keeping tier-1,
+    the named anchors, and every monopoly/oligopoly node."""
+    net = md.derive_meio_network(mps_planet_dataset, max_nodes=2500, seed=1)
+    assert len(net["nodes"]) <= 2500
+    kept = set(net["nodes"])
+    # all tier-1 kept
+    assert set(mps_planet_dataset["tier1"]).issubset(kept)
+    # all monopoly/oligopoly kept
+    crit = mps_planet_dataset["criticality"]
+    for n in mps_planet_dataset["tier2"] + mps_planet_dataset["tier3"]:
+        if crit.get(n) in ("monopoly_bottleneck", "oligopoly"):
+            assert n in kept, f"critical node {n} was dropped by sampling"
+    # edges restricted to kept nodes
+    for s, t in net["edges"]:
+        assert s in kept and t in kept
+    # deterministic for a fixed seed
+    net2 = md.derive_meio_network(mps_planet_dataset, max_nodes=2500, seed=1)
+    assert set(net["nodes"]) == set(net2["nodes"])
+
+
+def test_meio_planet_sampled_solves_optimally(mps_planet_dataset):
+    """A sampled planet-scale MEIO must solve optimally on CPU with a bounded
+    approximation error — the whole point of the sampling."""
+    net = md.derive_meio_network(mps_planet_dataset, max_nodes=2000, seed=1)
+    model = meio.build_meio_model(net)
+    result = meio.solve_meio(model)
+    assert result["termination_condition"].lower() == "optimal"
+    true = meio.true_safety_stock_cost(net, result["per_node"])
+    if true > 0:
+        rel = abs(result["total_safety_stock_cost"] - true) / true
+        assert rel < 0.05, f"pwl approx error {rel:.3%} exceeds 5% at planet scale"
 
 
 # --------------------------------------------------------------------------

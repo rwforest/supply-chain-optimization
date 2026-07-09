@@ -29,6 +29,19 @@ from __future__ import annotations
 import math
 import random
 
+from scripts.company_profiles import COMPANY_PROFILES
+
+# The real, named MPS tier-2 back-end anchors from company_profiles. Synthetic
+# "rest of market" peer nodes ALSO carry a (fictional) ``company_name``, so a
+# plain "has a company_name" test does not exclude them — at planet scale the
+# OSAT anchor's synthetic peers (all tagged ``advanced_packaging_osat``) would
+# otherwise balloon the FJSP machine set from ~11 to ~600, exploding the MILP.
+# Keying off this exact anchor-name set keeps the derived machine/depot set
+# scale-invariant (the FJSP models MPS's OWN back-end facilities, not the
+# entire synthetic packaging market). ``company_profiles`` is pure data — no
+# solver/GPU import is pulled in here.
+_MPS_TIER2_ANCHOR_NAMES = {a.company_name for a in COMPANY_PROFILES["mps"]["tier2"]}
+
 # Material-type tags (set on MPS's tier-2 anchors in
 # ``scripts/company_profiles.py``) that identify back-end assembly/test nodes.
 WAFER_SORT_FINAL_TEST = "wafer_sort_final_test"
@@ -56,14 +69,17 @@ _TEST_GROUPS = {WAFER_SORT_FINAL_TEST}
 
 def _anchor_tier2_by_material(dataset: dict, material_type: str) -> list[str]:
     """Return the tier-2 node IDs whose material_type matches, restricted to
-    the *named anchors* (company_name truthy) so we key off the real MPS
-    back-end facilities rather than the synthetic "rest of market" fan-out."""
+    the *real named MPS anchors* (``company_name`` in
+    ``_MPS_TIER2_ANCHOR_NAMES``) so we key off MPS's own back-end facilities
+    rather than the synthetic "rest of market" fan-out — which also carries a
+    fictional ``company_name`` and would otherwise inflate the set at scale."""
     smt = dataset["supplier_material_type"]
     names = dataset.get("company_name", {})
     return [
         node
         for node in dataset["tier2"]
-        if smt.get(node) == material_type and names.get(node)
+        if smt.get(node) == material_type
+        and names.get(node) in _MPS_TIER2_ANCHOR_NAMES
     ]
 
 
@@ -199,14 +215,15 @@ def derive_fjsp_processing_times(
 
 def select_cvrptw_depots(dataset: dict) -> list[dict]:
     """Depots = MPS's Chengdu and Penang facilities (the finished-goods
-    dispatch hubs). Falls back to any wafer_sort_final_test / engineering_ops
-    anchor if the exact names change."""
+    dispatch hubs). Restricted to the real named MPS anchors so a synthetic
+    peer (e.g. one of Penang's small fan-out) can't be mistaken for a depot —
+    keeping the depot set scale-invariant like the FJSP machine set."""
     smt = dataset["supplier_material_type"]
     names = dataset.get("company_name", {})
     region = dataset.get("region", {})
     depots: list[dict] = []
     for node in dataset["tier2"]:
-        if not names.get(node):
+        if names.get(node) not in _MPS_TIER2_ANCHOR_NAMES:
             continue
         if smt.get(node) in (WAFER_SORT_FINAL_TEST, ENGINEERING_OPS):
             depots.append(
@@ -356,12 +373,18 @@ _SERVICE_Z = {
 DEMAND_STD_FRACTION = 0.30
 
 
-def derive_meio_network(dataset: dict) -> dict:
-    """Assemble the MEIO (Guaranteed Service Model) network from the full
+def derive_meio_network(
+    dataset: dict,
+    max_nodes: int | None = None,
+    sample_fraction: float = 1.0,
+    seed: int = 41,
+    always_include_criticality: tuple[str, ...] = ("monopoly_bottleneck", "oligopoly"),
+) -> dict:
+    """Assemble the MEIO (Guaranteed Service Model) network from the
     tier1∪tier2∪tier3 dataset.
 
     Returns a dict with:
-        nodes:        list of node ids (all tiers)
+        nodes:        list of node ids
         edges:        list of (upstream, downstream) supplier->consumer pairs
         holding_cost: {node: unit holding cost}    (from calibrate_cost_fields)
         lead_time:    {node: processing/production lead time}  (production_delay)
@@ -373,6 +396,28 @@ def derive_meio_network(dataset: dict) -> dict:
     Demand is propagated the same direction the LP uses: tier-1 nodes carry
     the finished-goods demand ``d``; upstream nodes inherit demand from the
     tier-1 lines they (transitively) feed via a simple sum over edges.
+
+    **Scaling.** At the ``"planet"`` preset (~76k nodes) the piecewise-linear
+    GSM MILP has an INC block (binaries + constraints) per node, so an
+    unbounded solve is intractable in HiGHS. ``max_nodes`` / ``sample_fraction``
+    subsample the network before building the model, mirroring
+    ``scripts.disruption_scenarios.single_supplier_failure_scenarios``:
+
+    * All tier-1 nodes, all *named real anchors* (``company_name`` in
+      ``_MPS_TIER2_ANCHOR_NAMES``), and all nodes whose ``criticality`` is in
+      ``always_include_criticality`` are ALWAYS kept — these are the fragile,
+      capital-intensive nodes where safety-stock placement actually matters.
+    * The remaining (commodity) nodes are randomly sampled via a seeded rng.
+    * ``max_nodes`` (if set) caps the total kept-node count; it takes
+      precedence over ``sample_fraction`` by deriving the fraction needed to
+      hit the cap. ``sample_fraction=1.0`` with ``max_nodes=None`` (the
+      defaults) reproduces today's full-network behavior exactly.
+
+    Demand is propagated over the FULL network first, then the kept nodes
+    retain their true propagated demand; only edges with both endpoints kept
+    are retained (a node's upstream/downstream that got sampled out simply
+    drops from the GSM service-time coupling — an accepted approximation at
+    planet scale, flagged in the summary print).
     """
     tier1 = dataset["tier1"]
     tier2 = dataset["tier2"]
@@ -383,6 +428,7 @@ def derive_meio_network(dataset: dict) -> dict:
     holding_cost = dataset.get("holding_cost", {})
     production_delay = dataset.get("production_delay", {})
     criticality = dataset.get("criticality", {})
+    names = dataset.get("company_name", {})
     d = dataset["d"]
 
     # Edges as (upstream supplier, downstream consumer). The dataset's
@@ -393,13 +439,13 @@ def derive_meio_network(dataset: dict) -> dict:
         if src in node_set and tgt in node_set
     ]
 
-    # Demand mean per node: tier-1 uses d directly; upstream nodes get the sum
-    # of the demand of the immediate downstream nodes they supply (a coarse,
+    # Demand mean per node, propagated over the FULL network so kept nodes keep
+    # accurate demand: tier-1 uses d directly; upstream nodes get the sum of
+    # the demand of the immediate downstream nodes they supply (a coarse,
     # documented propagation — not the LP's exact BOM ratios).
     demand_mean: dict[str, float] = dict.fromkeys(nodes, 0.0)
     for n in tier1:
         demand_mean[n] = float(d.get(n, 0.0))
-    # Downstream-consumer demand for each supplier, propagated tier1<-tier2<-tier3.
     downstream_of: dict[str, list[str]] = {n: [] for n in nodes}
     for src, tgt in edges:
         downstream_of[src].append(tgt)
@@ -408,13 +454,43 @@ def derive_meio_network(dataset: dict) -> dict:
     for n in tier3:
         demand_mean[n] = sum(demand_mean.get(c, 0.0) for c in downstream_of[n]) or 1.0
 
+    # --- Optional subsampling for tractability at planet scale ---------------
+    def _always_keep(n: str) -> bool:
+        return (
+            n in dataset["tier1"]  # never drop finished-goods nodes
+            or names.get(n) in _MPS_TIER2_ANCHOR_NAMES  # real named anchors
+            or criticality.get(n) in always_include_criticality
+        )
+
+    if max_nodes is not None or sample_fraction < 1.0:
+        rng = random.Random(seed)
+        always = [n for n in nodes if _always_keep(n)]
+        rest = [n for n in nodes if not _always_keep(n)]
+
+        if max_nodes is not None:
+            target_rest = max(0, max_nodes - len(always))
+        else:
+            target_rest = round(sample_fraction * len(rest))
+        sampled = rng.sample(rest, min(target_rest, len(rest)))
+
+        kept = set(always) | set(sampled)
+        nodes = [n for n in nodes if n in kept]  # preserve tier order
+        edges = [(s, t) for s, t in edges if s in kept and t in kept]
+        print(
+            f"[derive_meio_network] planet-scale subsample: kept {len(nodes)} nodes "
+            f"({len(always)} always-kept: tier-1 + named anchors + "
+            f"{'/'.join(always_include_criticality)}; {len(sampled)}/{len(rest)} "
+            f"commodity nodes sampled), {len(edges)} edges retained"
+        )
+
     demand_std = {n: round(demand_mean[n] * DEMAND_STD_FRACTION, 3) for n in nodes}
     service_z = {n: _SERVICE_Z.get(criticality.get(n, "generic"), 1.645) for n in nodes}
     lead_time = {n: float(production_delay.get(n, 7.0)) for n in nodes}
     hcost = {n: float(holding_cost.get(n, 1.0)) for n in nodes}
+    demand_mean = {n: demand_mean[n] for n in nodes}
 
-    # Max service time quoted to the end customer at each tier-1 node — a
-    # modest cap so the GSM has a binding downstream constraint.
+    # Max service time quoted to the end customer at each tier-1 node (all
+    # tier-1 nodes are always kept, so this is unaffected by sampling).
     max_service_time = dict.fromkeys(tier1, 7.0)
 
     return {
