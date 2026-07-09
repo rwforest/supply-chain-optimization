@@ -1,0 +1,18 @@
+# GPU-only requirements for the `09_mps_cuopt_pipeline` notebook's FJSP/CVRPTW
+# solves on NVIDIA cuOpt. Install ONLY on a CUDA-12 GPU host (Linux/WSL2,
+# NVIDIA Volta+ / compute capability >= 7.0), from NVIDIA's package index:
+#
+#   pip install --extra-index-url=https://pypi.nvidia.com -r requirements-gpu.txt
+#
+# This is intentionally separate from requirements.txt (which every other
+# notebook installs on CPU-only clusters). Notebooks 01-08 never install this.
+#
+# CAVEAT: running these on Databricks serverless GPU compute is technically
+# feasible but NOT officially supported/documented by Databricks or NVIDIA as
+# of this writing. See docs/mps-cuopt-pipeline.md.
+#
+# cudf-cu12 is required only for the CVRPTW routing model (cuopt.routing);
+# the FJSP MILP path uses cuopt's in-process linear_programming API alone.
+nvidia-cuda-runtime-cu12==12.9.*
+cuopt-cu12==26.6.*
+cudf-cu12

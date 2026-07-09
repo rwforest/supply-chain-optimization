@@ -108,9 +108,52 @@ APPLE_TIER3_ANCHORS: list[AnchorSpec] = [
     AnchorSpec("Skyworks Solutions", 3, "rf_front_end", "USA", "oligopoly", (2, 4), (0, 0), feeds=("Foxconn", "Pegatron", "Luxshare Precision")),
 ]
 
+# ---------------------------------------------------------------------------
+# Monolithic Power Systems-like (fabless PMIC / power-module maker) anchors
+# ---------------------------------------------------------------------------
+# Sources (public reporting + "MPS Supply Chain Optimization Pipeline.md" in
+# this repo, 2022-2026): MPS is fabless and contracts multiple foundries
+# across Taiwan/China/Korea/Singapore for its proprietary BCD-process wafers,
+# with a headline long-term 8-inch capacity agreement with Vanguard
+# International Semiconductor (VIS). Fabricated wafers are shipped to MPS's
+# wholly-owned Chengdu (China) facility for wafer sort and final test;
+# packaging/assembly is outsourced to independent OSAT subcontractors in
+# China and Malaysia; MPS also opened a Penang (Malaysia) engineering/ops hub.
+#
+# MODELING NOTES / SIMPLIFICATIONS (documented, not oversights):
+#  * The Chengdu wafer-sort/final-test facility and the Penang engineering hub
+#    are MPS-OWNED (captive) facilities, not third-party suppliers. The repo's
+#    LP schema only has tier1/tier2/tier3 "supplier" slots, so we model these
+#    captive back-end nodes as tier-2 nodes — a deliberate schema simplification
+#    (see real_world_basis on each). Chengdu is tagged monopoly_bottleneck
+#    because it is a single wholly-owned wafer-sort/final-test chokepoint.
+#  * The OSAT subcontractors are given GENERIC labels ("Malaysia OSAT Partner",
+#    "China OSAT Partner") rather than named real vendors: the source doc does
+#    not disclose MPS's specific OSAT partners, so naming one would be an
+#    unverifiable real-company claim (inconsistent with this file's disclaimer).
+#  * ASML is deliberately EXCLUDED from the tier-3 equipment anchors: MPS's
+#    mature-node BCD process does not use EUV lithography, so ASML (EUV-only)
+#    does not plausibly feed this supply chain. This exclusion is intentional.
+MPS_TIER2_ANCHORS: list[AnchorSpec] = [
+    AnchorSpec("Vanguard International Semiconductor", 2, "specialty_wafer_foundry", "Taiwan", "oligopoly", (2, 4), (60, 120), real_world_basis="Long-term 8-inch (200mm) foundry capacity agreement announced 2022 (Singapore/Taiwan fabs)."),
+    AnchorSpec("Rest-of-World Foundry Partner", 2, "specialty_wafer_foundry", "South Korea", "oligopoly", (2, 4), (40, 90), real_world_basis="MPS contracts multiple elite foundries across Taiwan/China/Korea/Singapore; generic anchor for the non-VIS foundry base."),
+    AnchorSpec("MPS Chengdu Wafer Sort & Final Test", 2, "wafer_sort_final_test", "China", "monopoly_bottleneck", (0, 0), (30, 60), real_world_basis="MPS's wholly-owned 60,000 sq ft Chengdu facility (purchased 2015) for wafer sort and final test; a CAPTIVE facility modeled here as a tier-2 node, not a third-party supplier."),
+    AnchorSpec("Malaysia OSAT Partner", 2, "advanced_packaging_osat", "Malaysia", "oligopoly", (2, 4), (40, 80), real_world_basis="Independent OSAT subcontractor(s) in Malaysia perform monolithic packaging/assembly; generic label (specific vendor not publicly disclosed)."),
+    AnchorSpec("China OSAT Partner", 2, "advanced_packaging_osat", "China", "diversified_commodity", (3, 5), (40, 80), real_world_basis="Independent OSAT subcontractor(s) in China perform packaging/assembly, serving the 'China for China' domestic base; generic label."),
+    AnchorSpec("MPS Penang Engineering Hub", 2, "engineering_ops_support", "Malaysia", "diversified_commodity", (0, 1), (5, 15), real_world_basis="MPS's Penang engineering/operations hub (~60 engineers, advanced labs); a CAPTIVE support facility modeled as a small tier-2 node."),
+]
+MPS_TIER3_ANCHORS: list[AnchorSpec] = [
+    AnchorSpec("Applied Materials", 3, "deposition_etch_equipment", "USA", "oligopoly", (2, 3), (0, 0), feeds=("Vanguard International Semiconductor", "Rest-of-World Foundry Partner")),
+    AnchorSpec("Tokyo Electron", 3, "wafer_process_equipment", "Japan", "oligopoly", (2, 3), (0, 0), feeds=("Vanguard International Semiconductor", "Rest-of-World Foundry Partner")),
+    AnchorSpec("Shin-Etsu Chemical", 3, "silicon_wafer", "Japan", "oligopoly", (2, 3), (0, 0), feeds=("Vanguard International Semiconductor", "Rest-of-World Foundry Partner")),
+    AnchorSpec("Resonac Holdings", 3, "packaging_material", "Japan", "oligopoly", (2, 4), (0, 0), feeds=("Malaysia OSAT Partner", "China OSAT Partner", "MPS Chengdu Wafer Sort & Final Test")),
+    AnchorSpec("Amphenol", 3, "connectors_passives", "USA", "diversified_commodity", (4, 7), (0, 0), feeds=("Malaysia OSAT Partner", "China OSAT Partner")),
+]
+
 COMPANY_PROFILES: dict[str, dict[str, list[AnchorSpec]]] = {
     "nvidia": {"tier2": NVIDIA_TIER2_ANCHORS, "tier3": NVIDIA_TIER3_ANCHORS},
     "apple": {"tier2": APPLE_TIER2_ANCHORS, "tier3": APPLE_TIER3_ANCHORS},
+    "mps": {"tier2": MPS_TIER2_ANCHORS, "tier3": MPS_TIER3_ANCHORS},
 }
 
 # ---------------------------------------------------------------------------
@@ -179,6 +222,14 @@ PRODUCT_LINE_LABELS: dict[str, list[str]] = {
         "Accessories Line",
     ],
     "medium": ["Sedan Assembly Line", "SUV Assembly Line", "EV Assembly Line"],
+    "mps": [
+        "48V AI Server Power Module",
+        "DC-DC Converter IC",
+        "Automotive Power IC",
+        "Battery Management IC",
+        "Motor Driver Module",
+        "Intelli-Phase Power Module",
+    ],
 }
 
 REGION_WEIGHTS: dict[str, dict[str, float]] = {
@@ -203,6 +254,16 @@ REGION_WEIGHTS: dict[str, dict[str, float]] = {
         "Taiwan": 0.20,
         "South Korea": 0.15,
         "Japan": 0.10,
+        "USA": 0.10,
+    },
+    # MPS's "China for China" strategy makes China the largest region, with
+    # Taiwan (VIS + foundries), Malaysia (OSAT + Penang hub), Korea, and the
+    # USA (HQ / equipment vendors) rounding out the network.
+    "mps": {
+        "China": 0.35,
+        "Taiwan": 0.25,
+        "Malaysia": 0.20,
+        "South Korea": 0.10,
         "USA": 0.10,
     },
 }

@@ -37,14 +37,23 @@ Notebooks `05`–`07` add three additional tiers of realism on top of the **exac
 | **Simple** | `06` | ~27 nodes, single product line | Fictional (illustrative) company names; inventory/capacity are sized from BOM-propagated demand and a per-node criticality tag instead of independent randomness |
 | **Medium** | `06` | ~700 nodes, multi-product-line | Adds `region`-tagged suppliers (concentrated in real-world sourcing geographies), making regional/correlated disruptions meaningful |
 | **Complex** | `07` | ~2,300 nodes each (up to ~76,000+ via the `"planet"` scale preset — see below) | Two networks anchored on **real, publicly-known companies** — an Nvidia-like AI/GPU chip supply chain and an Apple-like consumer-electronics supply chain |
+| **Complex (MPS)** | `09` | ~2,300 nodes | A third real-company anchor — a **Monolithic Power Systems-like** fabless PMIC/power-module supply chain (VIS foundry + captive Chengdu wafer-sort/final-test + OSAT partners + Penang hub). Notebook `09` layers three GPU/CPU operations-research models on top of it (see below). |
 
 Datasets are generated in `05_realistic_operational_data`, using generators in `scripts/realistic_topologies.py`.
+
+### GPU-accelerated OR pipeline (MPS + NVIDIA cuOpt)
+
+Notebook `09_mps_cuopt_pipeline` goes beyond stress-testing the LP: it derives three classic operations-research problems from the MPS-like network and solves them — **FJSP** (flexible job-shop scheduling of back-end assembly/test) and **CVRPTW** (capacitated vehicle routing with time windows for distribution) on **NVIDIA cuOpt's GPU solvers**, plus **MEIO** (multi-echelon inventory optimization via the Guaranteed Service Model) on the existing Pyomo/HiGHS **CPU** stack. The problems are derived from the generated network (`scripts/mps_derivation.py`), not invented from scratch. See the [MPS cuOpt pipeline guide](docs/mps-cuopt-pipeline.md).
+
+> **cuOpt-on-Databricks support caveat:** running NVIDIA cuOpt on Databricks serverless GPU compute is technically feasible but is **not officially supported or documented by Databricks or NVIDIA** as of this writing. The GPU sections of `09` are gated behind a `run_gpu` widget (default `"no"`) so the derivation layer and the CPU MEIO solve run end-to-end on any cluster; the cuOpt wheels install separately from `requirements-gpu.txt` (NVIDIA's package index), never from `requirements.txt`.
 
 ### Real company names — disclaimer
 
 The complex-tier networks anchor tier 2 (direct component/module suppliers) and tier 3 (their equipment/raw-material suppliers) on real companies — e.g. TSMC, SK Hynix, ASML, Foxconn, Pegatron, Corning — drawn from public secondary reporting about these companies' real supplier relationships (see `scripts/company_profiles.py` for the full list and per-anchor citations), current as of 2026-07.
 
-> **Every numeric figure attached to a node in this accelerator — profit margin, inventory, demand, capacity — is synthetic and illustrative.** None of these figures represent actual disclosed financial or operational data from Nvidia, Apple, or any named supplier, and must not be used to draw real inferences about those companies. The simple and medium tiers use entirely fictional company names for the same reason.
+The **MPS-like** network (used by `09`) anchors on Monolithic Power Systems' publicly-reported structure: **Vanguard International Semiconductor (VIS)** and other foundry partners, MPS's wholly-owned **Chengdu** wafer-sort/final-test facility, OSAT packaging partners, and the **Penang** engineering hub, plus tier-3 equipment/material vendors (Applied Materials, Tokyo Electron, Shin-Etsu, Resonac, Amphenol). Three modeling choices are deliberate and documented in `scripts/company_profiles.py`: (1) the MPS-owned Chengdu/Penang facilities are **captive**, not third-party suppliers, but are modeled as tier-2 nodes because the LP schema only has tier1/tier2/tier3 slots; (2) the OSAT partners use **generic labels** since the source doc doesn't name them; (3) **ASML is deliberately excluded** — MPS's mature-node BCD process doesn't use EUV lithography.
+
+> **Every numeric figure attached to a node in this accelerator — profit margin, inventory, demand, capacity — is synthetic and illustrative.** None of these figures represent actual disclosed financial or operational data from Nvidia, Apple, MPS, or any named supplier, and must not be used to draw real inferences about those companies. The simple and medium tiers use entirely fictional company names for the same reason.
 
 ### Deep-dive documentation
 
@@ -55,6 +64,7 @@ The mechanics of *what* gets optimized, *what* breaks, and the newer Adexa-inspi
 | **[Optimization Objectives](docs/optimization-objectives.md)** | All 9 objectives — the original **TTR** & **TTS**, the 6 added LP objectives (`cost_min`, `revenue_max`, `inventory_opt`, `lead_time_min`, `fulfillment_rate`, `carbon_min`), and the structural `network_resilience` metric — with each objective function, its required fields, and caveats. |
 | **[Disruption Scenarios & Calibration](docs/disruption-scenarios.md)** | The 3 scenario *types* (single-supplier / regional / material-wide), the named real-world events, the structure-driven calibration methodology, and the modeling caveats. |
 | **[Multi-Period Planning & Network Decomposition](docs/multi-period-and-decomposition.md)** | The two Adexa-inspired additive modules: time-phased multi-period planning (lead-time offsets, inventory carryover, per-period disruption windows) and aggregate/disaggregate decomposition. |
+| **[MPS cuOpt Pipeline (FJSP / CVRPTW / MEIO)](docs/mps-cuopt-pipeline.md)** | The three operations-research formulations in notebook `09`, the `scripts/mps_derivation.py` translation layer, the unofficial cuOpt-on-Databricks-GPU support caveat, and the MEIO piecewise-linear-vs-nonlinear decision. |
 
 **Objectives, in brief:** `scripts/utils.py` has **8 `build_and_solve_*` LP objectives** (TTR + TTS + 6 added) plus **1 non-LP structural metric** (`compute_network_resilience_metrics`) = **9 total**. All 6 added objectives are purely additive — they reuse the `_prep_lp_data` skeleton and never modify `ttr`/`tts`. See the [objectives guide](docs/optimization-objectives.md) for the full breakdown.
 
@@ -65,6 +75,8 @@ The mechanics of *what* gets optimized, *what* breaks, and the newer Adexa-inspi
 ### How to run
 
 Run `05_realistic_operational_data` to generate the four datasets, then `06_realistic_stress_testing (simple and medium)` (single-node, direct-loop style, mirrors `02`), `07_realistic_stress_testing (complex network)` (Ray-distributed, mirrors `03`), and `08_multi_period_planning` (single-node, time-phased planning + network decomposition, mirrors `06`'s cluster spec). Tests for the generators and scenario library live in `tests/test_realistic_scenarios.py`; tests for the time-phased engine and network decomposition live in `tests/test_multi_period_planning.py` — run either with `python -m pytest tests/ -v` from the repo root (requires Python 3.12 for the `pyomo`/`highspy` wheels pinned in `uv.lock`).
+
+`05`'s dataset generation is controlled by a `regenerate_data` notebook widget (`"yes"`/`"no"`, default `"no"`) — since every generator is deterministically seeded, re-running `05` always reproduces the same six datasets, so by default it skips generation and loads the existing files from the volume instead of redoing the (redundant) work. Set it to `"yes"` (via the notebook UI or a job's `base_parameters`) to force a fresh regenerate-and-overwrite, e.g. after changing a generator or its seed.
 
 `07`'s "Optional: Planet-Scale Sample Sweep" section is controlled by a `run_planet_scale` notebook widget (`"yes"`/`"no"`, default `"yes"`) — set it to `"no"` (via the notebook UI or a job's `base_parameters`) to skip the ~76,000-node sweep and only run the main ~2,300-node complex pipeline.
 
@@ -99,6 +111,7 @@ Padding tier-3 nodes now attach via preferential attachment (`PreferentialAttach
 
 - The `region`, `company_name`, and `criticality` fields are not yet passed through `scripts/dataset_io.py`'s `explode_dataset_to_tables`, so they aren't queryable via the Genie space or `agent/supply_chain_agent.py` today — wiring those through is a natural follow-up.
 - The LP remains a fixed 3-tier model (tier1/tier2/tier3); real Nvidia/Apple chains have more like 4-6 tiers. The complex-tier generators compress this by treating tier 2 as "direct component/module suppliers" and tier 3 as "their equipment/raw-material suppliers," which is a simplification, not a literal reproduction of either company's actual supply chain depth.
+- Notebook `09_mps_cuopt_pipeline` is **GPU-optional and outside** the `05`→`08` Databricks multi-task Job graph in v1. Its FJSP/CVRPTW cuOpt solves require a CUDA-12 GPU and install from `requirements-gpu.txt` (NVIDIA's package index) — a combination that is technically feasible but not officially supported/documented by Databricks or NVIDIA. The derivation layer and the CPU MEIO solve run on any cluster; the GPU sections are gated behind `run_gpu` (default `"no"`). The full agentic orchestration pipeline (Adexa → LLM/NIM → LangChain → cuOpt → Adexa S&OE) from the source design doc is a documented future extension, not implemented in v1.
 
 ## 🚀 Getting Started
 
@@ -134,3 +147,5 @@ Any issues discovered through the use of this project should be filed as GitHub 
 | pyomo | An object-oriented algebraic modeling language in Python for structured optimization problems | BSD-3 | https://pypi.org/project/pyomo/
 | highspy | Linear optimization solver (HiGHS) | MIT | https://pypi.org/project/highspy/
 | ray | Framework for scaling AI/Python applications | Apache 2.0 | https://github.com/ray-project/ray
+| cuopt-cu12 | NVIDIA GPU-accelerated decision-optimization engine (notebook `09`, GPU-only) | NVIDIA proprietary — license terms pending verification; confirm at source before redistribution | https://pypi.org/project/cuopt-cu12/
+| cudf-cu12 | NVIDIA RAPIDS GPU DataFrame library (notebook `09`, GPU-only) | Apache 2.0 — confirm at source before redistribution | https://pypi.org/project/cudf-cu12/

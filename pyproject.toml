@@ -49,6 +49,20 @@ dev = [
     "ruff>=0.1.0",
     "black>=26.3.1",
 ]
+# GPU-only group for the `09_mps_cuopt_pipeline` notebook's FJSP/CVRPTW cuOpt
+# solves. NOT part of the default install and deliberately NOT folded into
+# requirements.txt (which every other notebook installs): these wheels require
+# a Linux/WSL2 host with a CUDA 12+ GPU (NVIDIA Volta+, compute capability
+# >=7.0) and must be installed from NVIDIA's index, e.g.:
+#   pip install --extra-index-url=https://pypi.nvidia.com -r requirements-gpu.txt
+# See requirements-gpu.txt and docs/mps-cuopt-pipeline.md. This combination
+# (cuOpt on Databricks serverless GPU) is technically feasible but not
+# officially supported/documented by Databricks or NVIDIA as of this writing.
+gpu = [
+    "nvidia-cuda-runtime-cu12==12.9.*",
+    "cuopt-cu12==26.6.*",
+    "cudf-cu12",
+]
 
 [tool.ruff]
 target-version = "py312"

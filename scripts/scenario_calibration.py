@@ -55,6 +55,15 @@ INDUSTRY_PROFILES: dict[str, IndustryProfile] = {
     "medium": IndustryProfile(0.05, 0.28, math.log(900), 0.50, 7, 20, 0.10, 0.40, 8, 30, 2, 8),
     "nvidia": IndustryProfile(0.35, 0.65, math.log(1500), 0.60, 5, 15, 0.05, 0.25, 50, 200, 5, 20),
     "apple": IndustryProfile(0.20, 0.45, math.log(5000), 0.60, 5, 15, 0.05, 0.25, 30, 150, 3, 15),
+    # MPS (fabless PMIC / power-module maker): margin band 0.40-0.62 reflects
+    # MPS's real ~55-60% gross margins (near/slightly below Nvidia's); demand
+    # mu = log(600) is well below Nvidia (1500)/Apple (5000), reflecting much
+    # smaller per-line unit volume; unit_cost (20-80) and emissions (2-10) sit
+    # between Nvidia's GPU-scale figures and the generic/medium tiers, since
+    # power ICs are simpler/cheaper per unit than GPUs but pricier than
+    # commodity auto parts. All values are illustrative/hand-calibrated — the
+    # same caveat class as the four entries above, NOT real MPS financial data.
+    "mps": IndustryProfile(0.40, 0.62, math.log(600), 0.55, 5, 15, 0.05, 0.25, 20, 80, 2, 10),
 }
 
 
