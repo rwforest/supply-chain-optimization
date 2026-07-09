@@ -74,6 +74,10 @@ The mechanics of *what* gets optimized, *what* breaks, and the newer Adexa-inspi
 
 **Multi-period & decomposition, in brief:** `scripts/multi_period_planning.py` and `scripts/network_aggregation.py` add time-phased planning and aggregate/disaggregate decomposition, both modeled after Adexa's structural advantages over a single-snapshot LP and both purely additive (walkthrough in `08_multi_period_planning.ipynb`). See the [multi-period guide](docs/multi-period-and-decomposition.md).
 
+### Where to start
+
+New to the repo or unsure where to begin? Open **`00_MASTER_start_here.ipynb`** first. It maps every notebook and module, runs an environment check, executes a CPU-only smoke test that proves the core engines work end-to-end (LP stress test + FJSP/CVRPTW derivation + MEIO solve, for both the `mps` and `apple_real` graphs), runs the test suite, and gives a decision guide pointing you to the right notebook for what you want to do.
+
 ### How to run
 
 Run `05_realistic_operational_data` to generate the four datasets, then `06_realistic_stress_testing (simple and medium)` (single-node, direct-loop style, mirrors `02`), `07_realistic_stress_testing (complex network)` (Ray-distributed, mirrors `03`), and `08_multi_period_planning` (single-node, time-phased planning + network decomposition, mirrors `06`'s cluster spec). Tests for the generators and scenario library live in `tests/test_realistic_scenarios.py`; tests for the time-phased engine and network decomposition live in `tests/test_multi_period_planning.py` — run either with `python -m pytest tests/ -v` from the repo root (requires Python 3.12 for the `pyomo`/`highspy` wheels pinned in `uv.lock`).
