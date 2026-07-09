@@ -427,7 +427,9 @@ SCALE_PRESETS: dict[str, dict] = {
 
 
 def generate_complex_network_at_scale(
-    company: Literal["nvidia", "apple", "mps"], scale: str = "complex", seed: int = 303
+    company: Literal["nvidia", "apple", "mps", "apple_real"],
+    scale: str = "complex",
+    seed: int = 303,
 ) -> dict:
     """Convenience wrapper around ``generate_complex_network`` using a named
     entry from ``SCALE_PRESETS`` instead of hand-tuning ``n2_target``/
@@ -438,7 +440,7 @@ def generate_complex_network_at_scale(
 
 
 def generate_complex_network(
-    company: Literal["nvidia", "apple", "mps"],
+    company: Literal["nvidia", "apple", "mps", "apple_real"],
     seed: int = 303,
     n1: int = 6,
     n2_target: int = 150,

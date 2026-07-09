@@ -55,6 +55,33 @@ def mps_planet_dataset():
     return _with_cost_fields(rt.generate_complex_network_at_scale("mps", scale="planet"))
 
 
+def _with_cost_fields_apple(d: dict) -> dict:
+    rng = random.Random(7)
+    fields = sc.calibrate_cost_fields(
+        rng,
+        d["tier1"], d["tier2"], d["tier3"],
+        d["material_types"], d["supplier_material_type"],
+        d["edges"], d.get("criticality"), "apple_real",
+        region=d.get("region"),
+    )
+    return {**d, **fields}
+
+
+@pytest.fixture(scope="module")
+def apple_real_dataset():
+    """The Apple-real complex network (grounded in Apple's published list),
+    used to confirm the SAME derivation pipeline runs on a second company via
+    APPLE_REAL_CONFIG."""
+    return _with_cost_fields_apple(rt.generate_complex_network("apple_real"))
+
+
+@pytest.fixture(scope="module")
+def apple_real_planet_dataset():
+    return _with_cost_fields_apple(
+        rt.generate_complex_network_at_scale("apple_real", scale="planet")
+    )
+
+
 # --------------------------------------------------------------------------
 # Derivation layer (no GPU / solver)
 # --------------------------------------------------------------------------
@@ -319,6 +346,76 @@ def test_meio_planet_sampled_solves_optimally(mps_planet_dataset):
     if true > 0:
         rel = abs(result["total_safety_stock_cost"] - true) / true
         assert rel < 0.05, f"pwl approx error {rel:.3%} exceeds 5% at planet scale"
+
+
+# --------------------------------------------------------------------------
+# Pipeline reuse — the SAME derivation engine runs on Apple's real graph via
+# APPLE_REAL_CONFIG (MPS was just the first example)
+# --------------------------------------------------------------------------
+def test_apple_real_config_selects_assembly_and_osat_machines(apple_real_dataset):
+    machines = md.select_backend_machines(apple_real_dataset, md.APPLE_REAL_CONFIG)
+    assert machines
+    groups = {m["group"] for m in machines}
+    assert "final_assembly" in groups
+    assert "advanced_packaging_osat" in groups
+    # test-capable machines are the OSATs for apple_real
+    test_capable = [m for m in machines if m["test_capable"]]
+    assert test_capable
+    assert all(m["group"] == "advanced_packaging_osat" for m in test_capable)
+
+
+def test_apple_real_every_job_op_has_eligible_machine(apple_real_dataset):
+    cfg = md.APPLE_REAL_CONFIG
+    machines = md.select_backend_machines(apple_real_dataset, cfg)
+    jobs = md.derive_fjsp_jobs(apple_real_dataset, machines, config=cfg)
+    pt = md.derive_fjsp_processing_times(jobs, machines, apple_real_dataset, config=cfg)
+    for job in jobs:
+        assert job["operations"] == cfg.operations
+        for op in job["operations"]:
+            elig = md.eligible_machines(op, machines, cfg)
+            assert elig, f"no eligible machine for {op}"
+            for m in elig:
+                assert (job["job_id"], op, m) in pt
+
+
+def test_apple_real_depots_and_customers(apple_real_dataset):
+    depots = md.select_cvrptw_depots(apple_real_dataset, md.APPLE_REAL_CONFIG)
+    assert depots  # final-assembly EMS sites
+    customers = md.derive_cvrptw_customers(apple_real_dataset)
+    assert len(customers) == len(apple_real_dataset["tier1"])
+
+
+def test_apple_real_machines_scale_invariant(apple_real_dataset, apple_real_planet_dataset):
+    cfg = md.APPLE_REAL_CONFIG
+    complex_n = len(md.select_backend_machines(apple_real_dataset, cfg))
+    planet_n = len(md.select_backend_machines(apple_real_planet_dataset, cfg))
+    assert complex_n == planet_n
+    assert len(md.select_cvrptw_depots(apple_real_dataset, cfg)) == len(
+        md.select_cvrptw_depots(apple_real_planet_dataset, cfg)
+    )
+
+
+def test_apple_real_planet_meio_solves_optimally(apple_real_planet_dataset):
+    net = md.derive_meio_network(
+        apple_real_planet_dataset, max_nodes=2000, seed=1, config=md.APPLE_REAL_CONFIG
+    )
+    assert len(net["nodes"]) <= 2000
+    model = meio.build_meio_model(net)
+    result = meio.solve_meio(model)
+    assert result["termination_condition"].lower() == "optimal"
+    true = meio.true_safety_stock_cost(net, result["per_node"])
+    if true > 0:
+        rel = abs(result["total_safety_stock_cost"] - true) / true
+        assert rel < 0.05
+
+
+def test_mps_config_still_default(mps_dataset):
+    """Regression: the default config (no arg) must still be MPS, byte-for-byte
+    with passing MPS_CONFIG explicitly."""
+    assert md.select_backend_machines(mps_dataset) == md.select_backend_machines(
+        mps_dataset, md.MPS_CONFIG
+    )
+    assert md.FJSP_OPERATIONS == md.MPS_CONFIG.operations
 
 
 # --------------------------------------------------------------------------

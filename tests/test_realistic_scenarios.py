@@ -31,6 +31,7 @@ GENERATORS = {
     "nvidia": lambda: rt.generate_complex_network("nvidia"),
     "apple": lambda: rt.generate_complex_network("apple"),
     "mps": lambda: rt.generate_complex_network("mps"),
+    "apple_real": lambda: rt.generate_complex_network("apple_real"),
 }
 
 
@@ -135,7 +136,7 @@ def test_material_shortage_scenario_disrupting_all_suppliers_still_feasible(data
     assert str(df.iloc[0]["termination_condition"]).lower() == "optimal"
 
 
-@pytest.mark.parametrize("company", ["nvidia", "apple", "mps"])
+@pytest.mark.parametrize("company", ["nvidia", "apple", "mps", "apple_real"])
 def test_complex_network_solves_a_bounded_scenario_subset(datasets, company):
     """Full LP solve at 1500-3000 node scale is sub-second per scenario;
     only a small subset is exercised here to keep test runtime bounded."""

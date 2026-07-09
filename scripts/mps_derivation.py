@@ -18,79 +18,138 @@ function here takes and returns plain Python dicts/lists and imports NO
 solver installed. The actual model construction/solve lives in
 ``scripts.fjsp_cuopt``, ``scripts.cvrptw_cuopt``, and ``scripts.meio_pyomo``.
 
+**Generic engine, per-company config.** MPS was the first example, but the
+derivation is company-parameterized via ``DerivationConfig``: the anchor-name
+set, which material-type tags become FJSP machines / test cells / CVRPTW
+depots, and the operation sequence all come from a config object. ``MPS_CONFIG``
+(the default on every function, preserving today's behavior) and
+``APPLE_REAL_CONFIG`` (Apple's published supplier list) are provided; pass a
+different config to run the same pipeline on another company's graph.
+
 All numeric figures produced here are synthetic/illustrative, consistent with
 the rest of the accelerator (see the disclaimer in
-``scripts/company_profiles.py``). Nothing here represents real MPS operational
-data.
+``scripts/company_profiles.py``). Nothing here represents real operational data.
 """
 
 from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass, field
 
 from scripts.company_profiles import COMPANY_PROFILES
 
-# The real, named MPS tier-2 back-end anchors from company_profiles. Synthetic
-# "rest of market" peer nodes ALSO carry a (fictional) ``company_name``, so a
-# plain "has a company_name" test does not exclude them — at planet scale the
-# OSAT anchor's synthetic peers (all tagged ``advanced_packaging_osat``) would
-# otherwise balloon the FJSP machine set from ~11 to ~600, exploding the MILP.
-# Keying off this exact anchor-name set keeps the derived machine/depot set
-# scale-invariant (the FJSP models MPS's OWN back-end facilities, not the
-# entire synthetic packaging market). ``company_profiles`` is pure data — no
-# solver/GPU import is pulled in here.
-_MPS_TIER2_ANCHOR_NAMES = {a.company_name for a in COMPANY_PROFILES["mps"]["tier2"]}
-
-# Material-type tags (set on MPS's tier-2 anchors in
-# ``scripts/company_profiles.py``) that identify back-end assembly/test nodes.
+# Material-type tags (set on tier-2 anchors in ``scripts/company_profiles.py``)
+# that identify MPS's back-end assembly/test nodes.
 WAFER_SORT_FINAL_TEST = "wafer_sort_final_test"
 ADVANCED_PACKAGING_OSAT = "advanced_packaging_osat"
 ENGINEERING_OPS = "engineering_ops_support"
 
-# The fixed back-end operation sequence every lot flows through. "flexible" in
-# FJSP means each operation may run on any machine in an eligible subset; here
-# packaging steps run on OSAT (or Chengdu) machines and electrical_test is
-# restricted to wafer-sort/final-test-capable machines (Chengdu + a flagged
-# OSAT subset), mirroring MPS owning its own test step.
-FJSP_OPERATIONS: list[str] = [
-    "die_attach",
-    "wire_bond",
-    "encapsulation",
-    "electrical_test",
-]
 
-# Which machine groups are eligible for each operation. Packaging operations
-# run on OSAT/Chengdu packaging machines; electrical_test runs only on
-# test-capable machines.
-_PACKAGING_GROUPS = {ADVANCED_PACKAGING_OSAT, WAFER_SORT_FINAL_TEST}
-_TEST_GROUPS = {WAFER_SORT_FINAL_TEST}
+@dataclass(frozen=True)
+class DerivationConfig:
+    """Per-company knobs that turn the generic derivation engine below into a
+    concrete FJSP/CVRPTW problem. MPS was the first example; the same functions
+    now serve any company by swapping this config.
+
+    Why an ``anchor_names`` set rather than "any node with a company_name":
+    synthetic "rest of market" peer nodes ALSO carry a (fictional)
+    ``company_name``, so at planet scale (``scale_factor=25``) an anchor's peers
+    would balloon the FJSP machine / CVRPTW depot set and explode the MILP.
+    Keying off the exact real-anchor name set keeps those sets scale-invariant
+    (the FJSP models a company's OWN back-end facilities, not the whole
+    synthetic market).
+    """
+
+    anchor_names: frozenset[str]
+    # tier-2 material_type tags whose (real-anchor) nodes become FJSP machines.
+    machine_material_tags: frozenset[str]
+    # subset of machine tags that are test-capable (run the test operation).
+    test_material_tags: frozenset[str]
+    # tier-2 material_type tags whose (real-anchor) nodes become CVRPTW depots.
+    depot_material_tags: frozenset[str]
+    # the fixed FJSP operation sequence every lot flows through.
+    operations: list[str]
+    # per-operation relative processing-time multiplier.
+    op_multiplier: dict[str, float]
+    # the operation restricted to test-capable machines (the rest run on any).
+    test_operation: str
+    # per-machine-tag number of parallel sub-machines to split each anchor into.
+    machine_subdivision: dict[str, int] = field(default_factory=dict)
+
+    def n_sub(self, tag: str) -> int:
+        return self.machine_subdivision.get(tag, 3)
 
 
-def _anchor_tier2_by_material(dataset: dict, material_type: str) -> list[str]:
+MPS_CONFIG = DerivationConfig(
+    anchor_names=frozenset(a.company_name for a in COMPANY_PROFILES["mps"]["tier2"]),
+    machine_material_tags=frozenset({WAFER_SORT_FINAL_TEST, ADVANCED_PACKAGING_OSAT}),
+    test_material_tags=frozenset({WAFER_SORT_FINAL_TEST}),
+    depot_material_tags=frozenset({WAFER_SORT_FINAL_TEST, ENGINEERING_OPS}),
+    operations=["die_attach", "wire_bond", "encapsulation", "electrical_test"],
+    op_multiplier={
+        "die_attach": 0.6,
+        "wire_bond": 1.0,
+        "encapsulation": 0.8,
+        "electrical_test": 1.4,
+    },
+    test_operation="electrical_test",
+    machine_subdivision={WAFER_SORT_FINAL_TEST: 3, ADVANCED_PACKAGING_OSAT: 4},
+)
+
+# Apple's published supplier list: final assemblers (Foxconn/Pegatron/…) are
+# the FJSP machines + CVRPTW dispatch depots; OSATs (Amkor/ASE/JCET/UTAC) are
+# the test-capable machines. Consumer-electronics back-end op sequence.
+APPLE_REAL_CONFIG = DerivationConfig(
+    anchor_names=frozenset(
+        a.company_name for a in COMPANY_PROFILES["apple_real"]["tier2"]
+    ),
+    machine_material_tags=frozenset({"final_assembly", ADVANCED_PACKAGING_OSAT}),
+    test_material_tags=frozenset({ADVANCED_PACKAGING_OSAT}),
+    depot_material_tags=frozenset({"final_assembly"}),
+    operations=["smt_placement", "module_assembly", "final_assembly", "functional_test"],
+    op_multiplier={
+        "smt_placement": 0.7,
+        "module_assembly": 1.0,
+        "final_assembly": 1.1,
+        "functional_test": 1.3,
+    },
+    test_operation="functional_test",
+    machine_subdivision={"final_assembly": 4, ADVANCED_PACKAGING_OSAT: 3},
+)
+
+# Back-compat alias: existing callers/tests that referenced the module-level
+# op sequence still work (== MPS's operations).
+FJSP_OPERATIONS: list[str] = MPS_CONFIG.operations
+
+
+def _anchor_tier2_by_material(
+    dataset: dict, material_type: str, config: DerivationConfig = MPS_CONFIG
+) -> list[str]:
     """Return the tier-2 node IDs whose material_type matches, restricted to
-    the *real named MPS anchors* (``company_name`` in
-    ``_MPS_TIER2_ANCHOR_NAMES``) so we key off MPS's own back-end facilities
-    rather than the synthetic "rest of market" fan-out — which also carries a
-    fictional ``company_name`` and would otherwise inflate the set at scale."""
+    the real named anchors (``company_name`` in ``config.anchor_names``) so we
+    key off a company's own back-end facilities rather than the synthetic
+    "rest of market" fan-out — which also carries a fictional ``company_name``
+    and would otherwise inflate the set at scale."""
     smt = dataset["supplier_material_type"]
     names = dataset.get("company_name", {})
     return [
         node
         for node in dataset["tier2"]
         if smt.get(node) == material_type
-        and names.get(node) in _MPS_TIER2_ANCHOR_NAMES
+        and names.get(node) in config.anchor_names
     ]
 
 
-def select_backend_machines(dataset: dict) -> list[dict]:
-    """Build the FJSP machine list from MPS's back-end tier-2 anchors.
+def select_backend_machines(
+    dataset: dict, config: DerivationConfig = MPS_CONFIG
+) -> list[dict]:
+    """Build the FJSP machine list from a company's back-end tier-2 anchors.
 
-    Each anchor facility (Chengdu, the OSAT partners) is split into a small
-    number of parallel sub-machines sized by that node's capacity (``c``) so
-    the schedule has real parallelism to exploit. Chengdu and OSAT machines
-    are ``test_capable`` per the network's material tags; packaging-only
-    machines are not.
+    Each anchor facility is split into a small number of parallel sub-machines
+    sized by that node's capacity (``c``) so the schedule has real parallelism
+    to exploit. Machines whose material tag is in ``config.test_material_tags``
+    are ``test_capable``.
 
     Returns a list of machine dicts:
         {"machine_id", "facility", "group", "region", "test_capable",
@@ -110,34 +169,44 @@ def select_backend_machines(dataset: dict) -> list[dict]:
                     "facility": node,
                     "group": group,
                     "region": region.get(node, "Unknown"),
-                    "test_capable": group in _TEST_GROUPS,
+                    "test_capable": group in config.test_material_tags,
                     "throughput": per_machine,
                 }
             )
 
-    # Chengdu wafer-sort/final-test: fewer, high-value test cells.
-    for node in _anchor_tier2_by_material(dataset, WAFER_SORT_FINAL_TEST):
-        _emit(node, WAFER_SORT_FINAL_TEST, n_sub=3)
-    # OSAT packaging lines: more parallel packaging machines.
-    for node in _anchor_tier2_by_material(dataset, ADVANCED_PACKAGING_OSAT):
-        _emit(node, ADVANCED_PACKAGING_OSAT, n_sub=4)
+    # Test-capable tags first (fewer, high-value cells), then the rest, so the
+    # machine ordering is stable and test cells lead the list.
+    ordered_tags = sorted(
+        config.machine_material_tags,
+        key=lambda t: (t not in config.test_material_tags, t),
+    )
+    for tag in ordered_tags:
+        for node in _anchor_tier2_by_material(dataset, tag, config):
+            _emit(node, tag, config.n_sub(tag))
 
     return machines
 
 
-def eligible_machines(operation: str, machines: list[dict]) -> list[str]:
-    """Machine IDs physically capable of processing ``operation``."""
-    if operation == "electrical_test":
+def eligible_machines(
+    operation: str, machines: list[dict], config: DerivationConfig = MPS_CONFIG
+) -> list[str]:
+    """Machine IDs physically capable of processing ``operation``. The
+    ``config.test_operation`` runs only on test-capable machines; every other
+    operation runs on any machine in the FJSP set."""
+    if operation == config.test_operation:
         return [m["machine_id"] for m in machines if m["test_capable"]]
-    # die_attach / wire_bond / encapsulation run on any packaging-capable machine
-    return [m["machine_id"] for m in machines if m["group"] in _PACKAGING_GROUPS]
+    return [m["machine_id"] for m in machines]
 
 
 def derive_fjsp_jobs(
-    dataset: dict, machines: list[dict], lot_size: int = 500, max_jobs: int = 40
+    dataset: dict,
+    machines: list[dict],
+    lot_size: int = 500,
+    max_jobs: int = 40,
+    config: DerivationConfig = MPS_CONFIG,
 ) -> list[dict]:
     """Convert tier-1 product-line demand (``d``) into a set of production
-    lots (jobs), each with the fixed 4-operation sequence.
+    lots (jobs), each with the company's fixed operation sequence.
 
     The number of lots per product line is ``ceil(demand / lot_size)``, capped
     across all lines at ``max_jobs`` so the FJSP stays a tractable, notebook-
@@ -171,7 +240,7 @@ def derive_fjsp_jobs(
                     "job_id": f"J{job_idx}",
                     "source_tier1": node,
                     "product_line": product_line.get(node, node),
-                    "operations": list(FJSP_OPERATIONS),
+                    "operations": list(config.operations),
                 }
             )
             job_idx += 1
@@ -179,7 +248,11 @@ def derive_fjsp_jobs(
 
 
 def derive_fjsp_processing_times(
-    jobs: list[dict], machines: list[dict], dataset: dict, seed: int = 11
+    jobs: list[dict],
+    machines: list[dict],
+    dataset: dict,
+    seed: int = 11,
+    config: DerivationConfig = MPS_CONFIG,
 ) -> dict[tuple[str, str, str], float]:
     """Per-(job, operation, machine) processing times.
 
@@ -192,40 +265,33 @@ def derive_fjsp_processing_times(
     production_delay = dataset.get("production_delay", {})
     machine_by_id = {m["machine_id"]: m for m in machines}
 
-    # Per-operation multipliers so the sequence has realistic relative cost:
-    # test is the slowest/most valuable step, die_attach the quickest.
-    op_multiplier = {
-        "die_attach": 0.6,
-        "wire_bond": 1.0,
-        "encapsulation": 0.8,
-        "electrical_test": 1.4,
-    }
-
     times: dict[tuple[str, str, str], float] = {}
     for job in jobs:
         for op in job["operations"]:
-            for mid in eligible_machines(op, machines):
+            for mid in eligible_machines(op, machines, config):
                 facility = machine_by_id[mid]["facility"]
                 base = production_delay.get(facility, 8.0)
-                mult = op_multiplier.get(op, 1.0)
+                mult = config.op_multiplier.get(op, 1.0)
                 jitter = rng.uniform(0.85, 1.15)
                 times[(job["job_id"], op, mid)] = round(base * mult * jitter, 3)
     return times
 
 
-def select_cvrptw_depots(dataset: dict) -> list[dict]:
-    """Depots = MPS's Chengdu and Penang facilities (the finished-goods
-    dispatch hubs). Restricted to the real named MPS anchors so a synthetic
-    peer (e.g. one of Penang's small fan-out) can't be mistaken for a depot —
+def select_cvrptw_depots(
+    dataset: dict, config: DerivationConfig = MPS_CONFIG
+) -> list[dict]:
+    """Depots = a company's finished-goods dispatch hubs (for MPS: Chengdu +
+    Penang; for apple_real: the final-assembly EMS sites). Restricted to the
+    real named anchors so a synthetic peer can't be mistaken for a depot —
     keeping the depot set scale-invariant like the FJSP machine set."""
     smt = dataset["supplier_material_type"]
     names = dataset.get("company_name", {})
     region = dataset.get("region", {})
     depots: list[dict] = []
     for node in dataset["tier2"]:
-        if names.get(node) not in _MPS_TIER2_ANCHOR_NAMES:
+        if names.get(node) not in config.anchor_names:
             continue
-        if smt.get(node) in (WAFER_SORT_FINAL_TEST, ENGINEERING_OPS):
+        if smt.get(node) in config.depot_material_tags:
             depots.append(
                 {
                     "depot_id": node,
@@ -379,6 +445,7 @@ def derive_meio_network(
     sample_fraction: float = 1.0,
     seed: int = 41,
     always_include_criticality: tuple[str, ...] = ("monopoly_bottleneck", "oligopoly"),
+    config: DerivationConfig = MPS_CONFIG,
 ) -> dict:
     """Assemble the MEIO (Guaranteed Service Model) network from the
     tier1∪tier2∪tier3 dataset.
@@ -404,7 +471,7 @@ def derive_meio_network(
     ``scripts.disruption_scenarios.single_supplier_failure_scenarios``:
 
     * All tier-1 nodes, all *named real anchors* (``company_name`` in
-      ``_MPS_TIER2_ANCHOR_NAMES``), and all nodes whose ``criticality`` is in
+      ``config.anchor_names``), and all nodes whose ``criticality`` is in
       ``always_include_criticality`` are ALWAYS kept — these are the fragile,
       capital-intensive nodes where safety-stock placement actually matters.
     * The remaining (commodity) nodes are randomly sampled via a seeded rng.
@@ -458,7 +525,7 @@ def derive_meio_network(
     def _always_keep(n: str) -> bool:
         return (
             n in dataset["tier1"]  # never drop finished-goods nodes
-            or names.get(n) in _MPS_TIER2_ANCHOR_NAMES  # real named anchors
+            or names.get(n) in config.anchor_names  # real named anchors
             or criticality.get(n) in always_include_criticality
         )
 

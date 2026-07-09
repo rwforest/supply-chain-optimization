@@ -14,6 +14,12 @@ synthetic and illustrative. None of these figures represent actual disclosed
 financial or operational data from Nvidia, Apple, or any named supplier, and
 must not be used to draw real inferences about those companies.
 
+The ``apple_real`` profile is a step further: its anchor names AND regions come
+from Apple's *published* Supplier List (FY2023), parsed by
+``scripts/apple_supplier_list.py`` from the committed ``Apple-Supplier-List.md``
+— a primary source rather than secondary reporting. The attached numbers there
+are still synthetic; only the names/regions are real.
+
 This module is deliberately the only place in the codebase that makes a
 real-company claim, so it can be reviewed/updated in isolation.
 
@@ -150,10 +156,29 @@ MPS_TIER3_ANCHORS: list[AnchorSpec] = [
     AnchorSpec("Amphenol", 3, "connectors_passives", "USA", "diversified_commodity", (4, 7), (0, 0), feeds=("Malaysia OSAT Partner", "China OSAT Partner")),
 ]
 
+# ---------------------------------------------------------------------------
+# Apple-REAL (grounded in Apple's PUBLISHED supplier list, not secondary
+# reporting) complex network anchors
+# ---------------------------------------------------------------------------
+# Unlike every other profile in this file, ``apple_real`` is built from a
+# PRIMARY source: Apple's official Supplier List (FY2023), committed to the
+# repo as ``Apple-Supplier-List.md``. ``scripts/apple_supplier_list.py`` parses
+# that document — every anchor's company_name and region come straight from it.
+# A curated lookup in that module classifies the ~40 recognizable names
+# (assemblers, OSATs, the TSMC foundry, displays, memory/optics/battery/
+# connector/analog vendors) into tier/role/criticality; every other parsed
+# supplier becomes a generic tier-3 component anchor tagged with its real
+# region. As always, the ATTACHED NUMBERS remain synthetic — only the names
+# and regions are real/published.
+from scripts.apple_supplier_list import build_apple_real_anchors  # noqa: E402
+
+APPLE_REAL_TIER2_ANCHORS, APPLE_REAL_TIER3_ANCHORS = build_apple_real_anchors()
+
 COMPANY_PROFILES: dict[str, dict[str, list[AnchorSpec]]] = {
     "nvidia": {"tier2": NVIDIA_TIER2_ANCHORS, "tier3": NVIDIA_TIER3_ANCHORS},
     "apple": {"tier2": APPLE_TIER2_ANCHORS, "tier3": APPLE_TIER3_ANCHORS},
     "mps": {"tier2": MPS_TIER2_ANCHORS, "tier3": MPS_TIER3_ANCHORS},
+    "apple_real": {"tier2": APPLE_REAL_TIER2_ANCHORS, "tier3": APPLE_REAL_TIER3_ANCHORS},
 }
 
 # ---------------------------------------------------------------------------
@@ -230,6 +255,14 @@ PRODUCT_LINE_LABELS: dict[str, list[str]] = {
         "Motor Driver Module",
         "Intelli-Phase Power Module",
     ],
+    "apple_real": [
+        "iPhone Line",
+        "iPad Line",
+        "Mac Line",
+        "Apple Watch Line",
+        "AirPods Line",
+        "Accessories Line",
+    ],
 }
 
 REGION_WEIGHTS: dict[str, dict[str, float]] = {
@@ -265,5 +298,18 @@ REGION_WEIGHTS: dict[str, dict[str, float]] = {
         "Malaysia": 0.20,
         "South Korea": 0.10,
         "USA": 0.10,
+    },
+    # apple_real: weights approximate the actual manufacturing-region footprint
+    # counted from Apple's published FY2023 supplier list (China dominant, then
+    # Taiwan/Japan/Vietnam/Korea/US/Thailand). Used for synthetic peer/padding
+    # region draws; the named anchors carry their own real region directly.
+    "apple_real": {
+        "China": 0.45,
+        "Taiwan": 0.14,
+        "Japan": 0.11,
+        "Vietnam": 0.10,
+        "South Korea": 0.08,
+        "USA": 0.07,
+        "Thailand": 0.05,
     },
 }

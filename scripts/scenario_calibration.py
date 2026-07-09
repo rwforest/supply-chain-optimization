@@ -64,6 +64,11 @@ INDUSTRY_PROFILES: dict[str, IndustryProfile] = {
     # commodity auto parts. All values are illustrative/hand-calibrated — the
     # same caveat class as the four entries above, NOT real MPS financial data.
     "mps": IndustryProfile(0.40, 0.62, math.log(600), 0.55, 5, 15, 0.05, 0.25, 20, 80, 2, 10),
+    # apple_real (Apple's published supplier list): shares the "apple"
+    # consumer-electronics band — moderate margins, very high per-line unit
+    # volume. Only the anchor names/regions differ (real/published); the
+    # illustrative calibration band is intentionally identical.
+    "apple_real": IndustryProfile(0.20, 0.45, math.log(5000), 0.60, 5, 15, 0.05, 0.25, 30, 150, 3, 15),
 }
 
 
